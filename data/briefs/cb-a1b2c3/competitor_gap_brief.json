@@ -1,0 +1,41 @@
+{
+  "prospect": "Acme Robotics Inc.",
+  "sector": "Industrial Robotics",
+  "size_band": "50-200 employees",
+  "prospect_ai_maturity": 2,
+  "prospect_percentile_in_cell": 0.47,
+  "top_quartile_sample": [
+    {"name": "Competitor A", "ai_maturity": 3, "confidence": "high"},
+    {"name": "Competitor B", "ai_maturity": 3, "confidence": "high"},
+    {"name": "Competitor C", "ai_maturity": 3, "confidence": "medium"}
+  ],
+  "gaps": [
+    {
+      "practice": "Named Head of AI / VP Data on public team page",
+      "top_quartile_adoption": "3/3",
+      "prospect_has": false,
+      "confidence": "high",
+      "source_refs": ["linkedin/teams", "competitor_careers_pages"]
+    },
+    {
+      "practice": "Open roles tagged 'LLM engineer' or 'applied scientist'",
+      "top_quartile_adoption": "3/3 · median 4 roles",
+      "prospect_has": true,
+      "prospect_count": 1,
+      "gap_magnitude": "4x",
+      "confidence": "high"
+    },
+    {
+      "practice": "Public GitHub org with recent model-training commits",
+      "top_quartile_adoption": "2/3",
+      "prospect_has": false,
+      "confidence": "medium",
+      "caveat": "Absence not proof of absence — many companies keep AI private"
+    }
+  ],
+  "brief_summary": "Acme sits at the 47th percentile of the Industrial Robotics 50–200-person cell. The top quartile consistently names a dedicated AI leader and publishes 3–5 LLM-engineering roles; Acme shows 0 and 1 respectively. This is the hook for outbound.",
+  "metadata": {
+    "draft": true,
+    "generated_at": "2026-04-22T09:16:41Z"
+  }
+}
