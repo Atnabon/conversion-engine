@@ -1,0 +1,77 @@
+{
+  "prospect": {
+    "name": "Acme Robotics Inc.",
+    "crunchbase_id": "cb-a1b2c3",
+    "sector": "Industrial Robotics",
+    "size_band": "50-200 employees",
+    "hq": "Boston, MA",
+    "last_enriched_at": "2026-04-22T09:14:02Z"
+  },
+  "signals": {
+    "funding_event": {
+      "present": true,
+      "round": "Series B",
+      "amount_usd": 22000000,
+      "closed_at": "2026-02-11",
+      "age_days": 70,
+      "confidence": "high",
+      "source_refs": ["crunchbase/cb-a1b2c3", "press/techcrunch-2026-02-12"]
+    },
+    "job_post_velocity": {
+      "open_roles_current": 38,
+      "open_roles_60d_ago": 11,
+      "delta_ratio": 3.45,
+      "confidence": "high",
+      "source_refs": ["builtin/scrape/2026-04-22", "linkedin/public/2026-02-21"]
+    },
+    "layoffs_120d": {
+      "present": false,
+      "confidence": "high",
+      "source_refs": ["layoffs.fyi/2026-04-22"]
+    },
+    "leadership_change_90d": {
+      "present": true,
+      "role": "CTO",
+      "appointed_at": "2026-03-06",
+      "age_days": 47,
+      "confidence": "medium",
+      "source_refs": ["crunchbase/cb-a1b2c3/news", "linkedin/public"]
+    },
+    "tech_stack": {
+      "matches_bench": ["python", "data", "ml"],
+      "confidence": "medium",
+      "source_refs": ["builtwith/acmerobotics.com"]
+    }
+  },
+  "ai_maturity": {
+    "score": 2,
+    "confidence": "high",
+    "per_input_justification": {
+      "ai_adjacent_open_roles": {"count": 1, "weight": "high", "contribution": 0.5},
+      "named_ai_leadership": {"present": false, "weight": "high", "contribution": 0.0},
+      "github_org_activity": {"present": true, "weight": "medium", "contribution": 0.5},
+      "executive_commentary": {"present": true, "weight": "medium", "contribution": 0.5},
+      "modern_data_ml_stack": {"signals": ["snowflake", "dbt"], "weight": "low", "contribution": 0.3},
+      "strategic_communications": {"present": true, "weight": "low", "contribution": 0.2}
+    }
+  },
+  "icp_classification": {
+    "segment": 3,
+    "confidence": 0.87,
+    "rationale": "Leadership-change window (47d) dominates signal weight over fresh funding (70d). Segment 3 pitch optimal; Segment 1 language would miss the new-CTO vendor-reassessment hook.",
+    "alternative_segments_considered": [
+      {"segment": 1, "confidence": 0.62},
+      {"segment": 4, "confidence": 0.41}
+    ]
+  },
+  "bench_match": {
+    "available_stacks": ["python", "data", "ml"],
+    "required_stacks_inferred": ["python", "ml"],
+    "match": true,
+    "bench_summary_snapshot_at": "2026-04-22T00:00:00Z"
+  },
+  "metadata": {
+    "draft": true,
+    "kill_switch_state": "unset_route_to_staff_sink"
+  }
+}
