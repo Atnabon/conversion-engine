@@ -1,0 +1,32 @@
+dev_tier:
+  provider: openrouter
+  model: qwen/qwen3-next-80b-a3b
+  temperature: 0.2
+  max_tokens: 4096
+  seed: 42
+  use_for:
+    - act1_baseline
+    - act3_probes
+    - act4_ablations
+
+eval_tier:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  temperature: 0.0
+  max_tokens: 4096
+  seed: 42
+  use_for:
+    - act4_held_out
+    - act5_final
+
+tau2_bench:
+  repo_commit: c7f2e4a
+  domain: retail
+  dev_slice_size: 30
+  held_out_slice_size: 20
+  trials: 5
+
+kill_switch:
+  default: unset
+  env_flag: TENACIOUS_LIVE_OUTREACH
+  unset_behavior: route_to_program_staff_sink
