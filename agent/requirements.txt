@@ -1,0 +1,29 @@
+# Core
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+httpx==0.27.2
+python-dotenv==1.0.1
+
+# LLM + tracing
+openai==1.54.0          # OpenRouter uses OpenAI-compatible API
+anthropic==0.39.0       # eval tier (Claude Sonnet 4.6)
+langfuse==2.54.0
+
+# Enrichment
+playwright==1.47.0
+beautifulsoup4==4.12.3
+pandas==2.2.3
+requests==2.32.3
+
+# Channel handlers
+resend==2.4.0
+africastalking==1.2.9
+
+# HubSpot MCP
+mcp==1.0.0
+
+# Eval
+# tau2-bench is installed via `pip install -e third_party/tau2-bench`
+numpy==2.1.2
+scipy==1.14.1           # CI + statistical tests
