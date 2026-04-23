@@ -77,20 +77,38 @@ All prospects during the challenge week are **synthetic** — public Crunchbase 
 ## Repository
 
 ```
-agent/        — orchestrator, channels, enrichment, tools
-eval/         — τ²-Bench harness, score_log, trace_log
-probes/       — Act III probe library (pending)
-data/         — seed materials + per-prospect briefs
-configs/      — pinned models, kill-switch template
-docs/         — architecture notes, runbook, screenshots
+agent/
+  webhook.py           FastAPI ingress for Resend/AT/Cal.com/HubSpot
+  reply_router.py      shared callback seam wired to every webhook
+  channels/            email_resend.py, sms_at.py (channel-hierarchy gate)
+  enrichment/          crunchbase, job_posts, layoffs_fyi, leadership,
+                       ai_maturity, competitor_gap, pipeline (merge)
+  tools/               hubspot_mcp.py, calcom_booking.py (booking→CRM link)
+tests/                 28 unit tests, all passing (pytest)
+eval/                  τ²-Bench harness, score_log.json, trace_log.jsonl
+data/
+  seed/                Tenacious ICP, style guide, pricing, transcripts…
+  schemas/             hiring_signal_brief + competitor_gap_brief schemas
+  policy/              data-handling policy + signed acknowledgement
+  briefs/cb-a1b2c3/    test-prospect briefs
+configs/               pinned_models.yaml, kill_switch.env.example
+docs/                  architecture notes, runbook, screenshots
+```
+
+Run the tests:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install pytest fastapi httpx
+python -m pytest tests/ -q
 ```
 
 ## Status
 
-- Act I (baseline) ✅ — 39.3% ± 3.8% on τ²-Bench retail dev slice, within 2.7 pp of published reference
-- Act II (production stack) ✅ — all nine components live, end-to-end synthetic-prospect trace verified
-- Act III (probes) — planned Day 4
-- Act IV (mechanism) — planned Days 5–6
+- Act I (baseline) ✅ — τ²-Bench retail, 150 simulations, 0 infra errors, pass@1 = **0.7267 [0.6504, 0.7917]**, avg cost \$0.0199/run, p50 105.95 s, p95 551.65 s (`eval/score_log.json`, commit `d11a9707`)
+- Act II (production stack) 🟡 — four-signal enrichment, email/SMS channels (channel-hierarchy gate enforced), HubSpot MCP writes with nine enrichment fields, Cal.com → HubSpot booking link, kill-switch default-off — all implemented and unit-tested; live-provider smoke runs scheduled Day 4
+- Act III (probes) — planned Day 4–5
+- Act IV (mechanism) — planned Day 6
 - Act V (memo) — planned Day 7
 
 ## License
