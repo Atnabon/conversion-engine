@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: conversion-engine
+    runtime: python
+    buildCommand: pip install -r agent/requirements.txt
+    startCommand: uvicorn agent.webhook:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_ADDRESS
+        sync: false
+      - key: AT_USERNAME
+        value: sandbox
+      - key: AT_API_KEY
+        sync: false
+      - key: AT_SHORTCODE
+        sync: false
+      - key: HUBSPOT_TOKEN
+        sync: false
+      - key: CALCOM_BASE_URL
+        sync: false
+      - key: CALCOM_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: LANGFUSE_HOST
+        value: https://cloud.langfuse.com
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
+      - key: CALCOM_WEBHOOK_SECRET
+        sync: false
+      - key: HUBSPOT_WEBHOOK_SECRET
+        sync: false
+      - key: STAFF_SINK_EMAIL
+        value: sink@tenacious-program.test
+      - key: STAFF_SINK_PHONE
+        value: "+251900000000"
+      # TENACIOUS_LIVE_OUTREACH intentionally omitted — kill-switch default is unset
