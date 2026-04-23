@@ -2,8 +2,6 @@
 
 Automated lead-generation and qualification system for Tenacious Consulting and Outsourcing.
 
-> TRP1 Week 10 — Interim submission covers Acts I (τ²-Bench baseline) and Act II (full production stack). See [`INTERIM_SUBMISSION.md`](INTERIM_SUBMISSION.md) for the interim report (Google-Docs-ready markdown with Mermaid diagrams).
-
 ## Architecture
 
 ```mermaid
