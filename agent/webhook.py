@@ -1,10 +1,17 @@
 """Webhook receiver for Render deployment.
 
 Registers once at $WEBHOOK_BASE_URL; all four integrations call in here:
-    POST /webhooks/resend   — inbound reply + bounce from Resend
-    POST /webhooks/at       — SMS delivery / reply from Africa's Talking
-    POST /webhooks/calcom   — booking.created / booking.cancelled from Cal.com
-    POST /webhooks/hubspot  — deal/contact events from HubSpot
+    POST /webhooks/resend       — inbound reply + bounce from Resend
+    POST /webhooks/at           — SMS delivery / reply from Africa's Talking
+    POST /webhooks/calcom       — booking.created / booking.cancelled from Cal.com
+    POST /webhooks/hubspot      — deal/contact events from HubSpot
+
+Plus one manual reply ingestion endpoint:
+    POST /conversations/reply   — manual reply ingestion for environments where
+                                  the email provider's reply webhook is gated
+                                  (e.g. Resend free tier requires a verified
+                                  sending domain; the Slack tutor confirmed
+                                  this manual path as the official workaround).
 
 Payloads are handed off to channel-specific adapters that parse, validate,
 and dispatch via `agent.reply_router`. The webhook module itself stays free
@@ -22,6 +29,9 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from datetime import datetime, timezone
+
+from agent import reply_router
 from agent.channels import email_resend, sms_at
 from agent.tools import calcom_booking
 
@@ -151,6 +161,63 @@ async def hubspot_webhook(
         # leaving the dispatch minimal avoids speculative coupling.
 
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Manual reply ingestion (Resend free-tier workaround)
+# ---------------------------------------------------------------------------
+#
+# The Resend free tier delivers outbound mail using a sandbox sender
+# (onboarding@resend.dev) but does not register reply webhooks unless the
+# trainee has a verified sending domain. The program tutors confirmed in
+# Slack that the supported workaround for the demo is a manual POST that
+# the trainee fires after replying in Gmail. The endpoint dispatches into
+# the same reply router every webhook uses so downstream behaviour
+# (qualifier, Cal.com slot proposal, HubSpot upsert) is identical
+# regardless of how the reply arrived.
+
+@app.post("/conversations/reply", status_code=status.HTTP_200_OK)
+async def manual_reply(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="malformed JSON body")
+
+    contact_email = str(payload.get("contact_email") or "").strip()
+    channel = str(payload.get("channel") or "email").strip().lower()
+    body_text = str(payload.get("body") or "").strip()
+
+    if not contact_email or not body_text:
+        raise HTTPException(
+            status_code=400,
+            detail="contact_email and body are required",
+        )
+    if channel not in {"email", "sms"}:
+        raise HTTPException(status_code=400, detail="channel must be 'email' or 'sms'")
+
+    now = datetime.now(timezone.utc)
+    if channel == "email":
+        event = reply_router.EmailReplyEvent(
+            thread_id=payload.get("thread_id") or f"manual-{now.timestamp():.0f}",
+            from_address=contact_email,
+            subject=str(payload.get("subject") or "Re: (manual)"),
+            body_text=body_text,
+            received_at=now,
+            raw=dict(payload),
+        )
+        reply_router.dispatch_email_reply(event)
+    else:
+        event = reply_router.SMSInboundEvent(
+            from_number=contact_email,
+            to_shortcode=str(payload.get("shortcode") or ""),
+            body=body_text,
+            received_at=now,
+            raw=dict(payload),
+        )
+        reply_router.dispatch_sms_inbound(event)
+
+    log.info("manual reply ingested channel=%s contact=%s", channel, contact_email)
+    return JSONResponse({"ok": True, "channel": channel, "warm": reply_router.is_warm(contact_email)})
 
 
 # ---------------------------------------------------------------------------
