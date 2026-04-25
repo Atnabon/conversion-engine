@@ -1,0 +1,7 @@
+{
+  "_doc": "60-day-prior snapshot of orrin-labs.example open engineering roles. Used by agent/enrichment/job_posts.py::_load_prior_snapshot to compute hiring velocity. This is the snapshot the demo replays from since live BuiltIn scraping is robots-disallowed at challenge time.",
+  "snapshot_taken_at": "2026-02-25T00:00:00Z",
+  "total_open_roles": 11,
+  "ai_adjacent_open_roles": 3,
+  "sources": ["builtin", "wellfound", "company_careers_page"]
+}

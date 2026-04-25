@@ -132,6 +132,16 @@ def upsert_contact_via_mcp(
     *,
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
+    if os.getenv("HUBSPOT_DIRECT_API", "").lower() in {"1", "true", "yes"}:
+        return _upsert_contact_via_rest(write, client=client)
+    return _upsert_contact_via_mcp_internal(write, client=client)
+
+
+def _upsert_contact_via_mcp_internal(
+    write: ContactWrite,
+    *,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
     endpoint = os.getenv("HUBSPOT_MCP_ENDPOINT", "http://localhost:3010")
     token = os.getenv("HUBSPOT_TOKEN", "")
     url = f"{endpoint.rstrip('/')}/tools/call"
@@ -164,6 +174,71 @@ def upsert_contact_via_mcp(
     return resp.json()
 
 
+def _upsert_contact_via_rest(
+    write: ContactWrite,
+    *,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Direct HubSpot REST upsert — used when HUBSPOT_DIRECT_API=true.
+
+    Bypasses the MCP server and posts the contact straight to
+    https://api.hubapi.com/crm/v3/objects/contacts. The token from
+    HUBSPOT_TOKEN must be a Private App access token with
+    crm.objects.contacts.write scope.
+    """
+    token = os.getenv("HUBSPOT_TOKEN", "")
+    if not token:
+        raise HubSpotWriteError("HUBSPOT_TOKEN not set; cannot call REST API")
+
+    properties = _payload_properties(write)
+    properties["email"] = write.email
+    body = {"properties": properties}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    owner = client or httpx.Client(timeout=10.0)
+    try:
+        # Try to update first by email (idempotent path).
+        search_url = "https://api.hubapi.com/crm/v3/objects/contacts/search"
+        search_resp = owner.post(
+            search_url,
+            json={
+                "filterGroups": [{"filters": [
+                    {"propertyName": "email", "operator": "EQ", "value": write.email}
+                ]}],
+                "properties": ["email"],
+                "limit": 1,
+            },
+            headers=headers,
+        )
+        if search_resp.status_code >= 400:
+            raise HubSpotWriteError(
+                f"HubSpot search failed: {search_resp.status_code} {search_resp.text[:500]}"
+            )
+        results = (search_resp.json() or {}).get("results") or []
+
+        if results:
+            contact_id = results[0]["id"]
+            url = f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}"
+            resp = owner.patch(url, json=body, headers=headers)
+        else:
+            url = "https://api.hubapi.com/crm/v3/objects/contacts"
+            resp = owner.post(url, json=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HubSpotWriteError(f"HubSpot REST request failed: {exc}") from exc
+    finally:
+        if client is None:
+            owner.close()
+
+    if resp.status_code >= 400:
+        raise HubSpotWriteError(
+            f"HubSpot REST upsert failed: status={resp.status_code} body={resp.text[:500]}"
+        )
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Booking → HubSpot link
 # ---------------------------------------------------------------------------
@@ -183,22 +258,70 @@ def record_booking(
     enrichment fields written at first outreach. This is the integration
     link the CRM+Calendar rubric requires.
     """
+    properties = {
+        "booking_uid": booking_uid,
+        "booking_start_time": start_time,
+        "booking_status": "scheduled",
+        "prospect_domain": prospect_domain or "",
+        "last_booking_sync_at": _now_iso(),
+    }
+
+    if os.getenv("HUBSPOT_DIRECT_API", "").lower() in {"1", "true", "yes"}:
+        # REST path — find the contact by email then PATCH the booking fields.
+        token = os.getenv("HUBSPOT_TOKEN", "")
+        if not token:
+            raise HubSpotWriteError("HUBSPOT_TOKEN not set")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        owner = client or httpx.Client(timeout=10.0)
+        try:
+            search_resp = owner.post(
+                "https://api.hubapi.com/crm/v3/objects/contacts/search",
+                json={
+                    "filterGroups": [{"filters": [
+                        {"propertyName": "email", "operator": "EQ", "value": email}
+                    ]}],
+                    "properties": ["email"],
+                    "limit": 1,
+                },
+                headers=headers,
+            )
+            results = (search_resp.json() or {}).get("results") or []
+            if not results:
+                # Create the contact if it doesn't exist yet (booking arrived first).
+                resp = owner.post(
+                    "https://api.hubapi.com/crm/v3/objects/contacts",
+                    json={"properties": {**properties, "email": email}},
+                    headers=headers,
+                )
+            else:
+                contact_id = results[0]["id"]
+                resp = owner.patch(
+                    f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}",
+                    json={"properties": properties},
+                    headers=headers,
+                )
+        except httpx.HTTPError as exc:
+            raise HubSpotWriteError(f"REST booking-write failed: {exc}") from exc
+        finally:
+            if client is None:
+                owner.close()
+
+        if resp.status_code >= 400:
+            raise HubSpotWriteError(
+                f"REST booking-write failed: status={resp.status_code} body={resp.text[:500]}"
+            )
+        return resp.json()
+
+    # Default MCP path
     endpoint = os.getenv("HUBSPOT_MCP_ENDPOINT", "http://localhost:3010")
     token = os.getenv("HUBSPOT_TOKEN", "")
     url = f"{endpoint.rstrip('/')}/tools/call"
-
     body = {
         "name": "hubspot.contacts.upsert",
         "arguments": {
             "idProperty": "email",
             "email": email,
-            "properties": {
-                "booking_uid": booking_uid,
-                "booking_start_time": start_time,
-                "booking_status": "scheduled",
-                "prospect_domain": prospect_domain or "",
-                "last_booking_sync_at": _now_iso(),
-            },
+            "properties": properties,
         },
     }
     headers = {"Content-Type": "application/json"}
