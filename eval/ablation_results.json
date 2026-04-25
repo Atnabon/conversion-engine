@@ -1,0 +1,101 @@
+{
+  "_doc": "Act IV ablation results. Each entry's pass@1 / cost / latency are produced by running the pinned τ²-Bench retail harness on the named slice (sealed held-out for the headline result). The day1_baseline row is the authoritative tutor-published Act I run; method and ablations are computed against the same 30 dev tasks for hyperparameter selection and against the 20-task sealed held-out for Delta A.",
+  "_provenance": {
+    "tau2_bench_commit": "d11a9707",
+    "harness_settings": "configs/pinned_models.yaml",
+    "kill_switch_state": "unset_route_to_staff_sink"
+  },
+  "conditions": [
+    {
+      "condition": "day1_baseline",
+      "label": "Act I tutor-authoritative reference",
+      "slice": "dev",
+      "slice_size": 30,
+      "trials": 5,
+      "n_runs": 150,
+      "pass_at_1": 0.7267,
+      "ci_95_lower": 0.6504,
+      "ci_95_upper": 0.7917,
+      "cost_usd_per_run": 0.0199,
+      "cost_usd_total": 2.985,
+      "latency_p50_s": 105.95,
+      "latency_p95_s": 551.65,
+      "infra_errors": 0,
+      "notes": "Authoritative — see eval/score_log.json and eval/trace_log.jsonl."
+    },
+    {
+      "condition": "method",
+      "label": "Honesty Gate + Tone-Preservation Re-check",
+      "slice": "held_out",
+      "slice_size": 20,
+      "trials": 5,
+      "n_runs": 100,
+      "pass_at_1": null,
+      "ci_95_lower": null,
+      "ci_95_upper": null,
+      "cost_usd_per_run": null,
+      "cost_usd_total": null,
+      "latency_p50_s": null,
+      "latency_p95_s": null,
+      "infra_errors": null,
+      "notes": "Pending Day-6 sealed held-out run. Pre-run estimate +3 to +6 pp Delta A vs day1_baseline; see method.md §Expected outcomes."
+    },
+    {
+      "condition": "ablation_a_honesty_gate_only",
+      "label": "Honesty Gate only (no tone re-check)",
+      "slice": "dev",
+      "slice_size": 30,
+      "trials": 5,
+      "n_runs": 150,
+      "pass_at_1": null,
+      "ci_95_lower": null,
+      "ci_95_upper": null,
+      "cost_usd_per_run": null,
+      "cost_usd_total": null,
+      "latency_p50_s": null,
+      "latency_p95_s": null,
+      "infra_errors": null,
+      "notes": "Pending. Tests whether the lift comes from the directive itself or the regeneration loop."
+    },
+    {
+      "condition": "ablation_b_tone_recheck_only",
+      "label": "Tone re-check only (no honesty gate)",
+      "slice": "dev",
+      "slice_size": 30,
+      "trials": 5,
+      "n_runs": 150,
+      "pass_at_1": null,
+      "ci_95_lower": null,
+      "ci_95_upper": null,
+      "cost_usd_per_run": null,
+      "cost_usd_total": null,
+      "latency_p50_s": null,
+      "latency_p95_s": null,
+      "infra_errors": null,
+      "notes": "Pending. Tests whether downstream filtering can substitute for upstream prompt shaping."
+    },
+    {
+      "condition": "ablation_c_strict_temperature_zero",
+      "label": "Full mechanism with temperature=0.0",
+      "slice": "dev",
+      "slice_size": 30,
+      "trials": 5,
+      "n_runs": 150,
+      "pass_at_1": null,
+      "ci_95_lower": null,
+      "ci_95_upper": null,
+      "cost_usd_per_run": null,
+      "cost_usd_total": null,
+      "latency_p50_s": null,
+      "latency_p95_s": null,
+      "infra_errors": null,
+      "notes": "Pending. Tests whether residual errors are sampling noise or systematic."
+    }
+  ],
+  "delta_a_plan": {
+    "comparison": "method vs day1_baseline on sealed held-out slice",
+    "test": "paired bootstrap, 10000 resamples, one-sided p < 0.05",
+    "decision_rule": "claim positive lift only if 95% CI lower bound on Delta A >= 0",
+    "anti_overclaim": "if Delta A CI crosses zero, report point estimate + CI and label 'no significant lift' in the memo"
+  }
+}
