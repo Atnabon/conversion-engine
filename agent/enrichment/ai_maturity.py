@@ -39,6 +39,15 @@ class SignalInput:
     source_url: str | None = None
 
 
+SILENT_COMPANY_DISCLAIMER = (
+    "No public AI signal found. Absence is not proof of absence — many "
+    "companies keep AI work private (private repos, internal tooling, "
+    "no public exec commentary). The agent must phrase any AI reference "
+    "to a score-0 prospect as a question, not an assertion, and may not "
+    "use Segment 4 (specialized capability gap) language."
+)
+
+
 @dataclass(frozen=True)
 class MaturityScore:
     score: int
@@ -46,10 +55,21 @@ class MaturityScore:
     confidence_numeric: float        # 0.0-1.0 — for schema field
     justifications: list[dict]
     raw_points: float
+    silent_company: bool              # True when no public signal at all
+    silent_company_disclaimer: str | None
 
 
 def score(signals: Iterable[SignalInput]) -> MaturityScore:
-    """Compute the 0-3 maturity score from a list of SignalInputs."""
+    """Compute the 0-3 maturity score from a list of SignalInputs.
+
+    Silent-company handling (rubric requirement): if the input list is
+    empty OR every signal contributes zero points (weight=0 or confidence=0),
+    return `score = 0` with `silent_company = True` and a disclaimer string
+    that the composer must surface alongside any AI-maturity reference.
+    Score 0 is also reachable from non-silent inputs (low-confidence,
+    low-weight signals that round down) — `silent_company` distinguishes
+    the two cases so the composer phrasing differs.
+    """
     signals_list = list(signals)
     raw = 0.0
     justifications: list[dict] = []
@@ -77,6 +97,18 @@ def score(signals: Iterable[SignalInput]) -> MaturityScore:
 
     raw = min(raw, float(_SCORE_MAX) + 0.75)
     integer_score = min(int(raw), _SCORE_MAX)
+
+    silent_company = (not signals_list) or total_weighted_evidence == 0.0
+    if silent_company and not justifications:
+        # Surface the disclaimer in the justifications list so the schema
+        # consumer always sees something for a silent company.
+        justifications.append({
+            "signal": "no_public_signal",
+            "status": SILENT_COMPANY_DISCLAIMER,
+            "weight": "low",
+            "confidence": "high",
+        })
+
     confidence_label = _confidence_label(
         high_weight_firing,
         signals_count=len(signals_list),
@@ -90,6 +122,8 @@ def score(signals: Iterable[SignalInput]) -> MaturityScore:
         confidence_numeric=confidence_numeric,
         justifications=justifications,
         raw_points=raw,
+        silent_company=silent_company,
+        silent_company_disclaimer=SILENT_COMPANY_DISCLAIMER if silent_company else None,
     )
 
 
