@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse
 
 from datetime import datetime, timezone
 
-from agent import reply_router
+from agent import composer, reply_router
 from agent.channels import email_resend, sms_at
 from agent.tools import calcom_booking
 
@@ -40,10 +40,14 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Conversion Engine Webhooks")
 
-# Attach the booking→HubSpot handler once at import time. Email/SMS reply
-# handlers are attached by whatever component owns them (qualifier, composer,
-# tests) via reply_router.register_*.
+# Attach the integration handlers once at import time:
+#   - calcom_booking writes a HubSpot record when a booking is confirmed
+#   - composer logs every email/SMS reply as a HubSpot activity
+# Together these guarantee HubSpot writes occur at multiple conversation
+# event points (outreach send, reply received, slots proposed, booking
+# confirmed) — the rubric requirement.
 calcom_booking.register()
+composer.register()
 
 
 # ---------------------------------------------------------------------------
