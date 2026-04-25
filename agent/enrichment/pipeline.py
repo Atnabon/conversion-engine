@@ -241,6 +241,8 @@ def run(
             "confidence_label": maturity.confidence_label,
             "phrasing_hint": ai_maturity.phrasing_hint(maturity.score, maturity.confidence_label),
             "justifications": maturity.justifications,
+            "silent_company": maturity.silent_company,
+            "silent_company_disclaimer": maturity.silent_company_disclaimer,
         },
         "hiring_velocity": {
             "open_roles_today": jobs.current.total_open_roles if jobs.current else 0,
