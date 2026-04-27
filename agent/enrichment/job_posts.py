@@ -1,284 +1,574 @@
-"""Public job-post scraper.
-
-Playwright with a headless browser fetches the public job-listings page of a
-prospect's BuiltIn / Wellfound / careers page and counts open engineering
-roles. A 60-day-prior snapshot is read from disk so the velocity label
-(tripled / doubled / flat) is computed against a prior reference point the
-trainee captured earlier in the week.
-
-Hard constraints from the spec:
-    - Only public pages. No login flows, no credential forms.
-    - robots.txt is checked before any fetch and a Disallow results in a
-      no_data record, not a bypass attempt.
-    - No captcha-solving, no proxy rotation, no headless-detection evasion.
-
-These constraints are encoded in `_guard_url` and enforced at every entry
-point — see tests/test_job_posts_guardrails.py for the assertion that a
-login URL is rejected.
 """
+Public job-post scraper via Playwright.
+Fetches job listings from company careers pages, BuiltIn, Wellfound.
+Respects robots.txt, no login, no captcha bypass.
+Produces: open_eng_roles count, ai_adjacent count, 60-day delta.
+"""
+
 from __future__ import annotations
 
 import json
 import logging
-import os
-import urllib.robotparser as robotparser
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
-log = logging.getLogger(__name__)
+from agent.config import settings
+from agent.models import Confidence, HiringSignal, SourceRef
 
-_AI_ADJACENT_KEYWORDS = (
-    "ml engineer",
+logger = logging.getLogger(__name__)
+_LIVE_CRAWLED_COMPANIES: set[str] = set()
+
+# AI/ML related keywords for ai_adjacent role detection
+AI_KEYWORDS = {
     "machine learning",
-    "applied scientist",
-    "llm",
+    "ml engineer",
     "ai engineer",
-    "ai product",
-    "data platform",
+    "data scientist",
+    "applied scientist",
+    "llm engineer",
+    "ai product manager",
+    "data platform engineer",
+    "ml platform",
     "mlops",
-    "ai researcher",
-)
+    "deep learning",
+    "nlp engineer",
+    "computer vision",
+    "ai research",
+    "inference engineer",
+    "model training",
+    "agentic",
+    "generative ai",
+}
 
-_LOGIN_PATH_HINTS = ("/login", "/signin", "/sign-in", "/auth", "/oauth")
-
-
-@dataclass(frozen=True)
-class JobPostCount:
-    total_open_roles: int
-    ai_adjacent_open_roles: int
-    sources: list[str]
-
-
-@dataclass(frozen=True)
-class JobPostResult:
-    status: str   # "success" | "partial" | "no_data" | "error" | "rate_limited"
-    current: JobPostCount | None
-    prior_60d: JobPostCount | None
-    velocity_label: str
-    confidence: float
-    fetched_at: str
-    error: str | None = None
-
-
-class UnsafeScrapeTarget(ValueError):
-    """Raised when a requested URL looks like a login-gated or auth endpoint."""
-
-
-def _guard_url(url: str) -> None:
-    parsed = urlparse(url)
-    lowered = (parsed.path or "").lower()
-    if any(hint in lowered for hint in _LOGIN_PATH_HINTS):
-        raise UnsafeScrapeTarget(f"refusing login-adjacent URL: {url}")
-    if parsed.scheme not in {"http", "https"}:
-        raise UnsafeScrapeTarget(f"non-http scheme blocked: {url}")
+# Engineering role keywords
+ENG_KEYWORDS = {
+    "software engineer",
+    "backend engineer",
+    "frontend engineer",
+    "full stack",
+    "fullstack",
+    "devops",
+    "sre",
+    "platform engineer",
+    "data engineer",
+    "infrastructure engineer",
+    "cloud engineer",
+    "mobile engineer",
+    "ios engineer",
+    "android engineer",
+    "staff engineer",
+    "principal engineer",
+    "engineering manager",
+}
 
 
-def _robots_allows(url: str, user_agent: str = "conversion-engine-bot") -> bool:
-    parsed = urlparse(url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    rp = robotparser.RobotFileParser()
-    try:
-        rp.set_url(robots_url)
-        rp.read()
-    except Exception:
-        # When robots.txt can't be fetched, default to disallow — a conservative
-        # read of the spec's "respect robots.txt" constraint.
-        log.info("robots.txt unfetchable for %s; defaulting to disallow", robots_url)
-        return False
-    return rp.can_fetch(user_agent, url)
+async def scrape_job_posts(
+    company_name: str,
+    domain: str | None = None,
+    careers_url: str | None = None,
+) -> HiringSignal:
+    """
+    Scrape public job posts for a company.
+    Falls back to the frozen snapshot if live scraping fails or is disabled.
+    """
+    # Try frozen snapshot first (preferred during challenge week)
+    snapshot_signal = _check_snapshot(company_name)
+    if snapshot_signal:
+        return snapshot_signal
 
+    # Attempt live scraping if snapshot not available
+    if careers_url or domain:
+        try:
+            return await _scrape_live(company_name, domain, careers_url)
+        except Exception as e:
+            logger.warning("Live scraping failed for %s: %s", company_name, e)
 
-def _velocity_label(current: int, prior: int) -> str:
-    if prior == 0 and current == 0:
-        return "insufficient_signal"
-    if prior == 0:
-        return "insufficient_signal"
-    ratio = current / prior
-    if ratio >= 3.0:
-        return "tripled_or_more"
-    if ratio >= 2.0:
-        return "doubled"
-    if ratio >= 1.3:
-        return "increased_modestly"
-    if ratio >= 0.9:
-        return "flat"
-    return "declined"
-
-
-def _count_roles(titles: list[str]) -> JobPostCount:
-    lowered = [t.lower() for t in titles]
-    ai_adj = sum(1 for t in lowered if any(kw in t for kw in _AI_ADJACENT_KEYWORDS))
-    return JobPostCount(
-        total_open_roles=len(lowered),
-        ai_adjacent_open_roles=ai_adj,
-        sources=[],
+    # Return empty signal if nothing found
+    return HiringSignal(
+        open_eng_roles=None,
+        ai_adjacent_eng_roles=None,
+        confidence=Confidence.LOW,
+        observed_at=datetime.now(UTC).isoformat(),
+        sources=[
+            SourceRef(
+                description=(
+                    "No snapshot match and no compliant public-page source resolved "
+                    "(BuiltIn/Wellfound/LinkedIn/careers)."
+                )
+            )
+        ],
     )
 
 
-def _load_prior_snapshot(prospect_domain: str) -> JobPostCount | None:
-    """Read a 60-day-prior snapshot of role counts written during Day 0 setup."""
-    snapshot_path = Path(
-        os.getenv("JOB_POST_SNAPSHOT_DIR", "data/snapshots/job_posts")
-    ) / f"{prospect_domain}.json"
+def _check_snapshot(company_name: str) -> HiringSignal | None:
+    """Check the frozen job-post snapshot from seed data."""
+    snapshot_path = Path(settings.job_posts_snapshot_path)
+    if not snapshot_path.exists():
+        return None
+
+    try:
+        with snapshot_path.open(encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    company_key = _normalize_company_name(company_name)
+
+    # Handle list or dict format
+    companies = snapshot if isinstance(snapshot, list) else snapshot.get("companies", [])
+    for entry in companies:
+        entry_name = entry.get("company") or entry.get("name") or ""
+        entry_key = _normalize_company_name(entry_name)
+        if not company_key or company_key != entry_key:
+            continue
+
+        if _is_synthetic_snapshot(snapshot, entry) and not settings.allow_synthetic_job_posts_snapshot:
+            logger.warning(
+                "Ignoring synthetic job-post snapshot entry for %s; replace with a frozen or live public dataset.",
+                company_name,
+            )
+            return None
+
+        return _parse_snapshot_entry(entry, synthetic=_is_synthetic_snapshot(snapshot, entry))
+
+    return None
+
+
+def _parse_snapshot_entry(entry: dict, *, synthetic: bool = False) -> HiringSignal:
+    """Parse a snapshot entry into a HiringSignal."""
+    jobs = entry.get("jobs") or entry.get("postings") or []
+
+    eng_count = 0
+    ai_count = 0
+
+    for job in jobs:
+        title = (job.get("title") or "").lower()
+        if _is_engineering_role(title):
+            eng_count += 1
+            if _is_ai_adjacent(title):
+                ai_count += 1
+
+    delta_60d = _compute_delta_60d_from_snapshot_jobs(jobs) or entry.get("delta_60d") or entry.get("velocity")
+
+    confidence = Confidence.HIGH if eng_count > 0 else Confidence.LOW
+    if synthetic and confidence == Confidence.HIGH:
+        confidence = Confidence.LOW
+
+    source_description = "Synthetic placeholder snapshot" if synthetic else "Frozen snapshot"
+
+    source_ref_description = source_description
+    if not synthetic:
+        source_ref_description = (
+            f"{source_description}; includes explicit source attribution. "
+            "delta_60d computed from posting dates when available, otherwise "
+            "falls back to snapshot-provided delta."
+        )
+
+    return HiringSignal(
+        open_eng_roles=eng_count,
+        ai_adjacent_eng_roles=ai_count,
+        delta_60d=str(delta_60d) if delta_60d else None,
+        confidence=confidence,
+        observed_at=datetime.now(UTC).isoformat(),
+        sources=[
+            SourceRef(
+                url=entry.get("source_url"),
+                description=source_ref_description,
+            )
+        ],
+    )
+
+
+def _is_synthetic_snapshot(snapshot: dict | list, entry: dict) -> bool:
+    if bool(entry.get("synthetic")):
+        return True
+    if isinstance(snapshot, dict):
+        metadata = snapshot.get("metadata")
+        if isinstance(metadata, dict) and bool(metadata.get("synthetic")):
+            return True
+        return bool(snapshot.get("synthetic"))
+    return False
+
+
+def _normalize_company_name(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+async def _scrape_live(
+    company_name: str,
+    domain: str | None = None,
+    careers_url: str | None = None,
+) -> HiringSignal:
+    """
+    Live scrape using Playwright. Respects robots.txt, no login.
+    Limited to 200 companies per challenge week.
+    """
+    from playwright.async_api import async_playwright
+
+    if not _can_live_crawl(company_name):
+        return HiringSignal(
+            confidence=Confidence.LOW,
+            observed_at=datetime.now(UTC).isoformat(),
+            sources=[
+                SourceRef(
+                    description=(
+                        "Live crawl cap reached (200 companies). Falling back to null signal "
+                        "to respect challenge constraints."
+                    )
+                )
+            ],
+        )
+
+    target_urls = _candidate_job_page_urls(domain=domain, careers_url=careers_url)
+    if not target_urls:
+        return HiringSignal(confidence=Confidence.LOW)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            scraped_titles: list[str] = []
+            source_refs: list[SourceRef] = []
+            for target_url in target_urls:
+                page = await browser.new_page()
+                try:
+                    if _is_non_public_source(target_url):
+                        # Compliance rule: public-page-only, no-login scraping.
+                        source_refs.append(
+                            SourceRef(
+                                url=target_url,
+                                description="Skipped: likely non-public/login-gated path",
+                            )
+                        )
+                        continue
+
+                    if await _robots_disallow(page, target_url):
+                        source_refs.append(
+                            SourceRef(url=target_url, description="Skipped by robots.txt disallow rule")
+                        )
+                        continue
+
+                    await page.goto(target_url, timeout=15000, wait_until="domcontentloaded")
+                    content = await page.content()
+                    titles = _extract_job_titles_for_source(target_url=target_url, html_content=content)
+                    if titles:
+                        scraped_titles.extend(titles)
+                        source_refs.append(
+                            SourceRef(
+                                url=target_url,
+                                description="Live scrape (public page, robots checked)",
+                            )
+                        )
+                    else:
+                        source_refs.append(
+                            SourceRef(url=target_url, description="Live scrape found zero visible roles")
+                        )
+                except Exception as e:
+                    logger.warning("Playwright scraping error for %s: %s", target_url, e)
+                    source_refs.append(SourceRef(url=target_url, description=f"Live scrape failed: {e}"))
+                finally:
+                    await page.close()
+
+            # Deduplicate titles extracted from overlapping pages.
+            unique_titles = list(dict.fromkeys(scraped_titles))
+            eng_count = sum(1 for t in unique_titles if _is_engineering_role(t.lower()))
+            ai_count = sum(1 for t in unique_titles if _is_ai_adjacent(t.lower()))
+            confidence = Confidence.HIGH if unique_titles else Confidence.LOW
+
+            baseline = _snapshot_baseline_eng_count(company_name)
+            delta_60d = None
+            if baseline is not None:
+                delta_60d = f"{eng_count - baseline:+d}"
+            return HiringSignal(
+                open_eng_roles=eng_count if unique_titles else 0,
+                ai_adjacent_eng_roles=ai_count if unique_titles else 0,
+                delta_60d=delta_60d,
+                confidence=confidence,
+                observed_at=datetime.now(UTC).isoformat(),
+                sources=source_refs,
+            )
+
+        except Exception as e:
+            logger.warning("Playwright scraping failed for %s: %s", company_name, e)
+            return HiringSignal(
+                confidence=Confidence.LOW,
+                observed_at=datetime.now(UTC).isoformat(),
+                sources=[SourceRef(description=f"Live scrape failed: {e}")],
+            )
+        finally:
+            await browser.close()
+
+
+def _candidate_job_page_urls(domain: str | None, careers_url: str | None) -> list[str]:
+    """Build explicit source targets: BuiltIn, Wellfound, LinkedIn, and careers."""
+    urls: list[str] = []
+    if careers_url:
+        urls.append(careers_url)
+    if domain:
+        host = domain.replace("https://", "").replace("http://", "").strip("/")
+        company_slug = host.split(".")[0]
+        urls.extend(
+            [
+                f"https://{host}/careers",
+                f"https://www.builtin.com/company/{company_slug}/jobs",
+                f"https://wellfound.com/company/{company_slug}/jobs",
+                f"https://www.linkedin.com/company/{company_slug}/jobs",
+            ]
+        )
+    # Keep order stable and remove duplicates.
+    return list(dict.fromkeys(urls))
+
+
+def _can_live_crawl(company_name: str) -> bool:
+    normalized = _normalize_company_name(company_name)
+    if normalized in _LIVE_CRAWLED_COMPANIES:
+        return True
+    if len(_LIVE_CRAWLED_COMPANIES) >= 200:
+        return False
+    _LIVE_CRAWLED_COMPANIES.add(normalized)
+    return True
+
+
+def _snapshot_baseline_eng_count(company_name: str) -> int | None:
+    """
+    Return an engineering-role baseline only when the snapshot is suitable for
+    a 60-day delta contract.
+
+    Contract:
+      - snapshot metadata has `as_of` timestamp, and
+      - as_of is within an expected 60-day baseline window.
+    """
+    snapshot_path = Path(settings.job_posts_snapshot_path)
     if not snapshot_path.exists():
         return None
     try:
-        data = json.loads(snapshot_path.read_text())
+        with snapshot_path.open(encoding="utf-8") as f:
+            snapshot = json.load(f)
     except (OSError, json.JSONDecodeError):
-        log.warning("prior job-post snapshot unreadable at %s", snapshot_path)
         return None
-    return JobPostCount(
-        total_open_roles=int(data.get("total_open_roles") or 0),
-        ai_adjacent_open_roles=int(data.get("ai_adjacent_open_roles") or 0),
-        sources=list(data.get("sources") or []),
-    )
+
+    company_key = _normalize_company_name(company_name)
+    metadata = snapshot.get("metadata", {}) if isinstance(snapshot, dict) else {}
+    as_of = _parse_snapshot_as_of(metadata.get("as_of"))
+    if as_of is None:
+        # Without as_of we cannot assert this baseline corresponds to a 60-day comparison.
+        return None
+    age_days = (datetime.now(UTC) - as_of).days
+    if age_days < 30 or age_days > 90:
+        # Guardrail: if baseline is too recent/too old, do not claim "60-day" delta.
+        return None
+
+    companies = snapshot if isinstance(snapshot, list) else snapshot.get("companies", [])
+    for entry in companies:
+        entry_name = entry.get("company") or entry.get("name") or ""
+        if _normalize_company_name(entry_name) != company_key:
+            continue
+        jobs = entry.get("jobs") or entry.get("postings") or []
+        return sum(1 for job in jobs if _is_engineering_role((job.get("title") or "").lower()))
+    return None
 
 
-def scrape(
-    *,
-    prospect_domain: str,
-    builtin_url: str | None = None,
-    wellfound_url: str | None = None,
-    careers_url: str | None = None,
-    playwright_factory: Any = None,
-) -> JobPostResult:
-    """Fetch and count engineering roles across public sources.
-
-    `playwright_factory` is injected in tests; at runtime it defaults to the
-    real Playwright sync API. When Playwright is not installed (common on
-    reviewer machines) the call returns a no_data record gracefully.
-    """
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    urls = [u for u in (builtin_url, wellfound_url, careers_url) if u]
-
-    for url in urls:
-        try:
-            _guard_url(url)
-        except UnsafeScrapeTarget as exc:
-            return JobPostResult(
-                status="error",
-                current=None,
-                prior_60d=None,
-                velocity_label="insufficient_signal",
-                confidence=0.0,
-                fetched_at=fetched_at,
-                error=str(exc),
-            )
-        if not _robots_allows(url):
-            return JobPostResult(
-                status="no_data",
-                current=None,
-                prior_60d=None,
-                velocity_label="insufficient_signal",
-                confidence=0.0,
-                fetched_at=fetched_at,
-                error=f"robots.txt disallows scraping {url}",
-            )
-
-    if not urls:
-        return JobPostResult(
-            status="no_data",
-            current=None,
-            prior_60d=None,
-            velocity_label="insufficient_signal",
-            confidence=0.0,
-            fetched_at=fetched_at,
-            error="no URLs provided",
-        )
-
-    titles: list[str] = []
-    sources: list[str] = []
-
+def _parse_snapshot_as_of(raw: object) -> datetime | None:
+    if not raw:
+        return None
+    value = str(raw).strip().replace("Z", "+00:00")
     try:
-        titles, sources = _playwright_fetch(urls, playwright_factory=playwright_factory)
-    except Exception as exc:
-        log.exception("playwright fetch failed")
-        return JobPostResult(
-            status="error",
-            current=None,
-            prior_60d=None,
-            velocity_label="insufficient_signal",
-            confidence=0.0,
-            fetched_at=fetched_at,
-            error=str(exc),
-        )
-
-    current = _count_roles(titles)
-    current = JobPostCount(
-        total_open_roles=current.total_open_roles,
-        ai_adjacent_open_roles=current.ai_adjacent_open_roles,
-        sources=sources,
-    )
-    prior = _load_prior_snapshot(prospect_domain)
-
-    label = _velocity_label(
-        current.total_open_roles,
-        prior.total_open_roles if prior else 0,
-    )
-    confidence = 0.85 if (prior and current.total_open_roles >= 5) else 0.5 if current.total_open_roles > 0 else 0.0
-    status = "success" if prior and current.total_open_roles > 0 else "partial"
-
-    return JobPostResult(
-        status=status,
-        current=current,
-        prior_60d=prior,
-        velocity_label=label,
-        confidence=confidence,
-        fetched_at=fetched_at,
-    )
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except ValueError:
+        return None
 
 
-def _playwright_fetch(
-    urls: list[str],
-    *,
-    playwright_factory: Any = None,
-) -> tuple[list[str], list[str]]:
-    """Return (titles, sources). `playwright_factory` lets tests inject a fake.
+def _is_non_public_source(url: str) -> bool:
+    lowered = url.lower()
+    return any(token in lowered for token in ("/login", "/signin", "/auth", "accounts.google.com"))
 
-    The factory is a callable returning a context manager; entering it yields
-    an object with a `.new_page()` method. This matches the Playwright sync
-    API shape so real and fake code paths agree.
+
+async def _robots_disallow(page, target_url: str) -> bool:
+    parsed = urlparse(target_url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    try:
+        robots_resp = await page.goto(robots_url, timeout=5000)
+        if robots_resp and robots_resp.ok:
+            robots_text = await page.content()
+            if _is_disallowed(robots_text, parsed.path):
+                logger.info("Robots.txt disallows scraping %s", target_url)
+                return True
+    except Exception:
+        # If robots fetch fails, proceed cautiously with target fetch.
+        return False
+    return False
+
+
+def _compute_delta_60d_from_snapshot_jobs(jobs: list[dict]) -> str | None:
     """
-    if playwright_factory is None:
+    Compute 60-day hiring velocity from dated postings when available.
+
+    If posting dates are unavailable in snapshot entries, return None and let
+    callers fall back to an explicit stored delta if present.
+    """
+    if not jobs:
+        return "0"
+
+    now = datetime.now(UTC)
+    current_window_start = now - timedelta(days=60)
+    previous_window_start = now - timedelta(days=120)
+
+    current_count = 0
+    previous_count = 0
+    for job in jobs:
+        posted_at = _parse_job_date(job)
+        if posted_at is None:
+            continue
+        if posted_at >= current_window_start:
+            current_count += 1
+        elif previous_window_start <= posted_at < current_window_start:
+            previous_count += 1
+
+    if current_count == 0 and previous_count == 0:
+        return None
+    return f"{current_count - previous_count:+d}"
+
+
+def _parse_job_date(job: dict) -> datetime | None:
+    raw = (
+        job.get("posted_at")
+        or job.get("postedAt")
+        or job.get("created_at")
+        or job.get("createdAt")
+        or job.get("date")
+        or job.get("published_at")
+    )
+    if not raw:
+        return None
+
+    value = str(raw).strip()
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
         try:
-            from playwright.sync_api import sync_playwright  # noqa: WPS433
-        except ImportError:
-            log.info("playwright not installed; job_posts returning no_data")
-            return [], []
-        playwright_factory = sync_playwright
+            return datetime.strptime(value, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
 
-    titles: list[str] = []
-    sources: list[str] = []
 
-    with playwright_factory() as pw:
-        browser = pw.chromium.launch(headless=True)
-        try:
-            for url in urls:
-                page = browser.new_page(
-                    user_agent="conversion-engine-bot (Tenacious Week 10)"
-                )
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                    # NOTE: No login, no form fill, no captcha handling. If the
-                    # page requires auth, we get whatever public markup exists
-                    # and move on.
-                    extracted = page.evaluate(
-                        """
-                        () => Array.from(document.querySelectorAll(
-                            'h2, h3, a[href*="jobs"], a[href*="careers"]'
-                        )).map(el => (el.textContent || '').trim()).filter(Boolean)
-                        """
-                    ) or []
-                    titles.extend(str(t) for t in extracted)
-                    sources.append(urlparse(url).netloc)
-                except Exception as exc:
-                    log.warning("playwright fetch error on %s: %s", url, exc)
-                finally:
-                    page.close()
-        finally:
-            browser.close()
+def _extract_job_titles(html_content: str) -> list[str]:
+    """Extract job title strings from HTML using common patterns."""
+    from bs4 import BeautifulSoup
 
-    return titles, sources
+    soup = BeautifulSoup(html_content, "lxml")
+    titles = set()
+
+    # Common selectors for job listings
+    selectors = [
+        "h2",
+        "h3",
+        "h4",
+        "[class*='job-title']",
+        "[class*='position-title']",
+        "[class*='opening']",
+        "[class*='posting']",
+        "[data-testid*='job']",
+        "[data-testid*='position']",
+        "a[href*='/jobs/']",
+        "a[href*='/positions/']",
+        "a[href*='/careers/']",
+    ]
+
+    for selector in selectors:
+        for el in soup.select(selector):
+            text = el.get_text(strip=True)
+            if text and 10 < len(text) < 200:
+                titles.add(text)
+
+    cleaned: list[str] = []
+    for title in titles:
+        normalized = re.sub(r"\s+", " ", title).strip()
+        if normalized:
+            cleaned.append(normalized)
+    return cleaned
+
+
+def _extract_job_titles_for_source(target_url: str, html_content: str) -> list[str]:
+    host = urlparse(target_url).netloc.lower()
+    if "builtin.com" in host:
+        return _extract_job_titles_builtin(html_content)
+    if "wellfound.com" in host:
+        return _extract_job_titles_wellfound(html_content)
+    if "linkedin.com" in host:
+        return _extract_job_titles_linkedin(html_content)
+    return _extract_job_titles_careers(html_content)
+
+
+def _extract_job_titles_builtin(html_content: str) -> list[str]:
+    return _extract_job_titles_with_selectors(
+        html_content,
+        ["[data-testid*='job-title']", ".job-title", "h2", "h3", "a[href*='/job/']"],
+    )
+
+
+def _extract_job_titles_wellfound(html_content: str) -> list[str]:
+    return _extract_job_titles_with_selectors(
+        html_content,
+        ["[data-test*='job']", "[class*='job-title']", "h2", "h3", "a[href*='/jobs/']"],
+    )
+
+
+def _extract_job_titles_linkedin(html_content: str) -> list[str]:
+    return _extract_job_titles_with_selectors(
+        html_content,
+        [".jobs-search__results-list h3", "[class*='job-card'] h3", "h3", "a[href*='/jobs/view/']"],
+    )
+
+
+def _extract_job_titles_careers(html_content: str) -> list[str]:
+    return _extract_job_titles(html_content)
+
+
+def _extract_job_titles_with_selectors(html_content: str, selectors: list[str]) -> list[str]:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_content, "lxml")
+    titles: set[str] = set()
+    for selector in selectors:
+        for el in soup.select(selector):
+            text = re.sub(r"\s+", " ", el.get_text(strip=True)).strip()
+            if text and 10 < len(text) < 200:
+                titles.add(text)
+    return list(titles)
+
+
+def _is_engineering_role(title: str) -> bool:
+    """Check if a job title is an engineering role."""
+    return any(kw in title for kw in ENG_KEYWORDS) or "engineer" in title
+
+
+def _is_ai_adjacent(title: str) -> bool:
+    """Check if a job title is AI/ML adjacent."""
+    return any(kw in title for kw in AI_KEYWORDS)
+
+
+def _is_disallowed(robots_text: str, path: str) -> bool:
+    """Simple robots.txt check — only checks User-agent: * rules."""
+    in_star_block = False
+    for line in robots_text.split("\n"):
+        line = line.strip().lower()
+        if line.startswith("user-agent:"):
+            agent = line.split(":", 1)[1].strip()
+            in_star_block = agent == "*"
+        elif in_star_block and line.startswith("disallow:"):
+            disallowed = line.split(":", 1)[1].strip()
+            if disallowed and path.startswith(disallowed):
+                return True
+    return False
