@@ -1,0 +1,27 @@
+{
+  "n_total": 25,
+  "n_success": 20,
+  "n_failed": 5,
+  "kill_switch_enabled": true,
+  "pipeline_latency_ms": {
+    "p50": 64052.2,
+    "p95": 91099.7,
+    "min": 47820.0,
+    "max": 91099.7,
+    "mean": 63172.7
+  },
+  "cost_usd": {
+    "total": 0.102,
+    "per_prospect": {
+      "p50": 0.005121,
+      "p95": 0.005231,
+      "min": 0.004986,
+      "max": 0.005231,
+      "mean": 0.005101
+    }
+  },
+  "segment_distribution": {
+    "abstain": 20
+  },
+  "gap_brief_coverage": 20
+}
