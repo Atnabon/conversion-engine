@@ -1,206 +1,549 @@
-# The Conversion Engine
+# Conversion Engine
 
-Automated lead-generation and qualification system for Tenacious Consulting and Outsourcing.
+**Automated lead generation and conversion for Tenacious Consulting & Outsourcing.**
+
+Finds net-new prospective clients from public data, qualifies them against a real intent signal, runs a voice-preserving nurture sequence, and books discovery calls — with every interaction written back to HubSpot and every claim auditable through a signed trace.
+
+- **Framework:** FastAPI · Python 3.12 · [uv](https://docs.astral.sh/uv/)
+- **LLM:** OpenRouter (dev-tier: DeepSeek V3 · eval-tier: Claude Sonnet 4.6)
+- **Stack:** Resend · Africa's Talking · HubSpot MCP · Cal.com · Langfuse
+- **Benchmark:** τ²-Bench retail (Sierra Research)
+- **Status:** Acts I + II complete · interim submission 2026-04-23
+
+---
+
+## Table of Contents
+
+1. [What this is](#what-this-is)
+2. [Architecture](#architecture)
+3. [Quick start](#quick-start)
+4. [Configuration](#configuration)
+5. [Running the agent](#running-the-agent)
+6. [Testing](#testing)
+7. [Deployment](#deployment)
+8. [Project layout](#project-layout)
+9. [Channel hierarchy & policy](#channel-hierarchy--policy)
+10. [Design decisions](#design-decisions)
+11. [Observability](#observability)
+12. [Data handling](#data-handling)
+13. [License & attribution](#license--attribution)
+
+---
+
+## What this is
+
+The Conversion Engine is a production-grade prospecting and conversion system built for Tenacious Consulting. It executes a four-stage pipeline per prospect:
+
+1. **Enrich** — merges public signals from Crunchbase, layoffs.fyi, job-post pages (Playwright), and press releases into a structured `hiring_signal_brief.json` with per-signal confidence scores.
+2. **Classify** — assigns each prospect to one of four ICP segments (recently-funded / mid-market-restructuring / leadership-transition / capability-gap), with an explicit **abstain** option when confidence is low.
+3. **Draft** — composes a signal-grounded email in the Tenacious voice, with a tone-preservation check, bench-gated commitments, and confidence-aware phrasing (ASK vs. ASSERT).
+4. **Deliver** — sends via Resend (email), falls back to Africa's Talking (SMS, warm leads only), writes every conversation event to HubSpot via its MCP server, and books the discovery call in Cal.com.
+
+The system is graded on the **evidence graph**: every numeric claim in the final memo must resolve to a trace file the reviewer can open. Cost per qualified lead, latency percentiles, and reply-rate deltas are all derived from traces, not assertions.
+
+---
 
 ## Architecture
 
+### System components
+
 ```mermaid
-flowchart LR
-    Seed[Public data:<br/>Crunchbase · layoffs.fyi<br/>BuiltIn · LinkedIn · GitHub] --> Enrich[Enrichment pipeline<br/>FastAPI + Playwright]
-    Enrich --> Briefs[hiring_signal_brief.json<br/>competitor_gap_brief.json]
-    Briefs --> Agent[Conversion Engine Agent<br/>ICP classifier · pitch selector<br/>tone check · bench guard]
-    Agent --> Email[Resend / MailerSend<br/>primary]
-    Agent --> SMS[Africa's Talking<br/>warm-lead scheduling]
-    Agent --> Voice[Shared Voice Rig<br/>discovery call · bonus]
-    Email --> HubSpot[HubSpot MCP]
-    Email --> Cal[Cal.com]
-    SMS --> HubSpot
-    Voice --> HubSpot
-    Agent -.traces.-> Langfuse[Langfuse Cloud]
+flowchart TB
+    subgraph Inputs ["Public Data Sources"]
+        CB[Crunchbase ODM Sample<br/>1,001 firmographic records]
+        LO[layoffs.fyi<br/>3,485 records]
+        JP[Public Job Pages<br/>BuiltIn · Wellfound · /careers]
+        PR[Press + Leadership<br/>public announcements]
+    end
+
+    subgraph Enrich ["Enrichment Pipeline"]
+        direction TB
+        E1[Crunchbase matcher<br/>firmographics + funding]
+        E2[Playwright job scraper<br/>velocity delta 60d]
+        E3[Layoffs parser<br/>events in last 120d]
+        E4[Leadership detector<br/>new CTO/VP in 90d]
+        E5[AI-maturity scorer 0-3<br/>per-input justification]
+        E6[Competitor-gap brief<br/>top-quartile cohort]
+    end
+
+    subgraph Agent ["Agent Core"]
+        ICP[ICP Classifier<br/>4 segments + abstain]
+        DRAFT[Email Drafter<br/>tone-check + bench-gate]
+        ORCH[Orchestrator<br/>state machine]
+        CONV[Conversation Store]
+    end
+
+    subgraph Channels ["Delivery — strict channel hierarchy"]
+        direction LR
+        EMAIL[1 Email<br/>Resend]
+        SMS[2 SMS<br/>Africas Talking<br/>WARM LEADS ONLY]
+        VOICE[3 Voice<br/>discovery call<br/>human delivery lead]
+    end
+
+    subgraph External ["External Systems"]
+        HS[HubSpot CRM<br/>via MCP server]
+        CAL[Cal.com v2<br/>bookings + webhooks]
+        LF[Langfuse<br/>trace + cost attribution]
+    end
+
+    subgraph Webhooks ["Inbound Webhooks"]
+        WEMAIL["/webhooks/email/reply<br/>Resend event routing"]
+        WSMS["/webhooks/sms/inbound<br/>route_inbound_sms"]
+        WCAL["/webhooks/calcom<br/>BOOKING events"]
+    end
+
+    CB --> E1
+    LO --> E3
+    JP --> E2
+    PR --> E4
+    E1 --> E5
+    E2 --> E5
+    PR --> E6
+    E1 --> E6
+
+    E1 --> ICP
+    E2 --> ICP
+    E3 --> ICP
+    E4 --> ICP
+    E5 --> ICP
+    E6 --> DRAFT
+
+    ICP --> DRAFT
+    DRAFT --> ORCH
+    ORCH --> CONV
+    ORCH --> EMAIL
+    ORCH --> SMS
+    ORCH --> HS
+    ORCH --> CAL
+
+    WEMAIL -.reply.-> ORCH
+    WSMS -.reply.-> ORCH
+    WCAL -.booking event.-> ORCH
+
+    CAL --> HS
+    EMAIL -.trace.-> LF
+    SMS -.trace.-> LF
+    HS -.trace.-> LF
+    CAL -.trace.-> LF
+    DRAFT -.LLM gen.-> LF
 ```
 
-## Channel priority
+### Conversation state machine
 
-1. **Email** — primary. Founders / CTOs / VPs Engineering live in email.
-2. **SMS** — secondary. Warm leads only (replied once, want fast scheduling).
-3. **Voice** — discovery call, booked by agent, delivered by a human Tenacious delivery lead.
+```mermaid
+stateDiagram-v2
+    [*] --> ColdEmail: new prospect<br/>(enriched + classified)
+    ColdEmail --> Warm: email reply received
+    ColdEmail --> Stalled: no reply in 7d
+    Warm --> CallBooked: Cal.com slot confirmed
+    Warm --> SMSScheduling: prospect requests SMS<br/>for fast coordination
+    SMSScheduling --> CallBooked
+    Stalled --> ReEngagement: 14d silence threshold
+    ReEngagement --> Warm: reply received
+    ReEngagement --> Abandoned: no reply in 30d
+    CallBooked --> [*]: human delivery lead<br/>takes the call
+    Abandoned --> [*]
+```
 
-## Setup
+SMS is gated at the channel boundary: `send_sms(warm_lead=False)` raises `SMSChannelPolicyError`. Cold SMS to Tenacious-segment prospects (founders, CTOs, VPs Engineering) is a documented brand risk and is impossible to trigger from code.
+
+---
+
+## Quick start
+
+### Prerequisites
+
+- **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Node.js 18+** — required for the HubSpot MCP server (`npx @hubspot/mcp-server`)
+- **Playwright** browsers — installed in step 3 below
+
+### Installation
 
 ```bash
-# 1. Clone + install
-git clone https://github.com/<org>/conversion-engine.git
+git clone https://github.com/atnabon/conversion-engine.git
 cd conversion-engine
-python -m venv .venv && source .venv/bin/activate
-pip install -r agent/requirements.txt
 
-# 2. Provision accounts (Day 0 pre-flight)
-cp configs/kill_switch.env.example .env
-# Fill in: RESEND_API_KEY, AT_USERNAME, AT_API_KEY, HUBSPOT_TOKEN,
-#          CALCOM_BASE_URL, OPENROUTER_KEY, LANGFUSE_*
+# 1. Install Python deps (pinned via uv.lock)
+uv sync
 
-# 3. Start Cal.com locally
-cd infra/calcom && docker compose up -d && cd -
+# 2. Copy env template and fill in API keys (see Configuration below)
+cp .env.example .env
+${EDITOR:-vim} .env
 
-# 4. Verify stack
-python -m agent.channels.email_resend --smoke
-python -m agent.channels.sms_at --smoke
-python -m agent.tools.hubspot_mcp --smoke
-python -m agent.tools.calcom_booking --smoke
+# 3. Install Playwright browsers (for job-post scraping)
+uv run playwright install chromium
 
-# 5. Run Act I baseline
-cd eval && python tau2_harness.py --domain retail --trials 5 --slice dev
+# 4. Verify everything is wired
+uv run pytest tests/ -q
 ```
 
-## Kill-switch
+---
 
-```
-TENACIOUS_LIVE_OUTREACH  default: unset
+## Configuration
+
+All settings are loaded from environment variables (via `pydantic-settings`). The `.env.example` file lists every variable with a placeholder; the table below groups them by purpose.
+
+| Variable                    | Required | Purpose                                                                                                        |
+| --------------------------- | :------: | -------------------------------------------------------------------------------------------------------------- |
+| `OPENROUTER_API_KEY`        |    ✅    | LLM backbone (dev and eval tiers both route through OpenRouter)                                                |
+| `DEV_MODEL`                 |          | Dev-tier model. Default `deepseek/deepseek-chat-v3-0324`                                                       |
+| `EVAL_MODEL`                |          | Eval-tier model. Default `anthropic/claude-sonnet-4-20250514`                                                  |
+| `RESEND_API_KEY`            |    ✅    | Email delivery (primary channel)                                                                               |
+| `RESEND_FROM_EMAIL`         |    ✅    | Verified sender domain, e.g. `outbound@yourdomain.com`                                                         |
+| `RESEND_WEBHOOK_SECRET`     |          | Shared secret for inbound-reply webhook validation                                                             |
+| `AT_USERNAME`               |          | Africa's Talking account. Default `sandbox`                                                                    |
+| `AT_API_KEY`                |    ✅    | Africa's Talking API key                                                                                       |
+| `AT_SHORTCODE`              |          | Virtual short code (sandbox-provisioned)                                                                       |
+| `HUBSPOT_ACCESS_TOKEN`      |    ✅    | Private App token with CRM scopes                                                                              |
+| `USE_HUBSPOT_MCP`           |          | `true` routes CRM writes through `@hubspot/mcp-server`; `false` uses direct REST                               |
+| `CALCOM_API_KEY`            |    ✅    | Cal.com v2 API key                                                                                             |
+| `CALCOM_BASE_URL`           |          | Default `https://api.cal.com`                                                                                  |
+| `CALCOM_EVENT_TYPE_ID`      |    ✅    | Numeric ID of the discovery-call event type                                                                    |
+| `LANGFUSE_PUBLIC_KEY`       |    ✅    | Langfuse trace ingestion                                                                                       |
+| `LANGFUSE_SECRET_KEY`       |    ✅    |                                                                                                                |
+| `LANGFUSE_BASE_URL`         |          | Default `https://cloud.langfuse.com`                                                                           |
+| **`LIVE_OUTBOUND_ENABLED`** |          | **Kill switch.** Default `false`. Set to `true` only after policy review — see [Data handling](#data-handling) |
+| `APP_ENV`                   |          | `development` (dev-tier LLM) or `production` (eval-tier LLM)                                                   |
+| `SEEDS_DIR`                 |          | Default `./tenacious_sales_data/seed`                                                                          |
+
+### HubSpot MCP setup
+
+To route CRM writes through the MCP server:
+
+1. Ensure Node.js 18+ and `npx` are on `PATH`: `node --version`
+2. Set `USE_HUBSPOT_MCP=true` in `.env`
+3. Grant the Private App the following scopes:
+   - `crm.objects.contacts.read/write`
+   - `crm.objects.companies.read/write`
+   - `crm.schemas.contacts.write` _(required for bootstrapping custom enrichment properties)_
+4. First run will invoke `hubspot-create-property` to bootstrap the 5 enrichment properties (`enrichment_timestamp`, `icp_segment`, `icp_confidence`, `ai_maturity_score`, `signal_brief_trace_id`)
+
+If MCP setup fails at runtime (Node missing, scope issue, etc.), the factory falls back to the direct HubSpot REST API with a one-time warning. The demo stays green either way.
+
+---
+
+## Running the agent
+
+### End-to-end demo — one synthetic prospect
+
+```bash
+uv run python -m scripts.run_full_thread_demo \
+  --company "Consolety" \
+  --contact-name "Alex Demo" \
+  --contact-email "alex@example.com" \
+  --contact-title "CTO"
 ```
 
-**Default (unset)** routes every outbound message to the program-staff sink. **Live routing** requires the flag to be explicitly set AND reviewer sign-off recorded in `configs/live_outreach_approval.json`. Do not set this flag during the challenge week.
+Runs the full pipeline: enrichment → classification → cold email → simulated reply → warm reply → SMS scheduling → HubSpot contact + notes → Cal.com booking → Cal.com-to-HubSpot status update. Outputs `outputs/full_thread_trace.json` plus an append to `outputs/full_thread_traces.jsonl`.
+
+### Batch demo — 20 prospects for p50/p95 latency
+
+```bash
+uv run python -m scripts.run_batch_20           # runs 19 (skips the one you already ran)
+uv run python -m scripts.compute_latency        # prints p50/p95 + writes outputs/latency_report.json
+```
+
+### FastAPI server — webhook endpoints
+
+```bash
+uv run uvicorn agent.main:app --reload
+```
+
+Registers three webhooks:
+
+| Route                        | Handler                                                                                                                                    | Source                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| `POST /webhooks/email/reply` | Routes Resend events (`email.received` → reply, `email.bounced` → suppression, else acknowledged)                                          | Resend dashboard           |
+| `POST /webhooks/sms/inbound` | Delegates to `route_inbound_sms` — dispatches to `handle_prospect_reply`, `handle_inbound_sms`, `handle_sms_opt_out`, or `handle_sms_help` | Africa's Talking dashboard |
+| `POST /webhooks/calcom`      | Handles `BOOKING_CREATED`, `BOOKING_CANCELLED`, `BOOKING_RESCHEDULED`                                                                      | Cal.com webhooks           |
+
+Plus REST endpoints:
+
+```bash
+# Process a new prospect (enrich + classify + draft + send-via-sink)
+curl -X POST http://localhost:8000/api/prospect/new \
+  -H "Content-Type: application/json" \
+  -d '{"company_name": "Example Corp", "contact_email": "cto@example.com"}'
+
+# List active conversations
+curl http://localhost:8000/api/conversations
+
+# System metrics (p50/p95 per stage, cost, call counts)
+curl http://localhost:8000/api/metrics
+```
+
+### τ²-Bench evaluation
+
+```bash
+# Dev-slice baseline (5 trials × 30 tasks by default; override with --trials / --tasks)
+uv run python -m eval.harness
+
+# Writes: eval/score_log.json (mean, 95% CI, cost), eval/trace_log.jsonl (trajectories)
+```
+
+### HubSpot MCP tool catalog
+
+```bash
+uv run python -m scripts.list_hubspot_mcp_tools
+# outputs/hubspot_mcp_tools.json — 21 tools + full input schemas
+```
+
+---
+
+## Testing
+
+```bash
+uv run pytest tests/ -v
+```
+
+70 tests across 7 files covering:
+
+| File                     | Coverage                                                                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_enrichment.py`     | Signal scorer, AI maturity, competitor-gap cohort selection, per-signal confidence                                                                |
+| `test_icp_classifier.py` | 4 segment classifiers + abstain, confidence thresholds, Segment 4 hard gate                                                                       |
+| `test_orchestrator.py`   | End-to-end pipeline wiring, HubSpot + Cal.com integration, kill-switch behavior                                                                   |
+| `test_sms_routing.py`    | **Inbound SMS dispatch** — STOP → opt-out, HELP → help, matching phone → `handle_prospect_reply`, no match → new thread, never-dead-end invariant |
+| `test_guardrails.py`     | Seed-loader resolution, bench-gated commitments                                                                                                   |
+| `test_job_posts.py`      | Playwright scraper, synthetic snapshot fallback, robots.txt compliance                                                                            |
+| `test_build_report.py`   | Report regeneration, trace-file indexing                                                                                                          |
+
+Fast tier (`-m "not slow and not live"`) runs in under 5 seconds and is safe for CI.
+
+---
+
+## Deployment
+
+### Render (free tier)
+
+A `render.yaml` is checked into the repo. Push to `main` and Render auto-deploys:
+
+```yaml
+services:
+  - type: web
+    runtime: python
+    buildCommand: python -m pip install -e .
+    startCommand: python -m uvicorn agent.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+```
+
+All sensitive env vars (`OPENROUTER_API_KEY`, `HUBSPOT_ACCESS_TOKEN`, etc.) are marked `sync: false` — set them in the Render dashboard, not in the yaml.
+
+Live URL: **<https://conversion-engine.onrender.com>** · Health: `/health` returns 200
+
+---
+
+## Project layout
+
+```text
+conversion-engine/
+├── agent/                          Core package
+│   ├── channels/                   Outbound + inbound communication
+│   │   ├── email_handler.py        Resend send + reply webhook parsing
+│   │   └── sms_handler.py          Africa's Talking + route_inbound_sms
+│   ├── core/                       Agent logic
+│   │   ├── orchestrator.py         End-to-end pipeline + inbound handlers
+│   │   ├── email_drafter.py        Signal-grounded drafting + tone check
+│   │   ├── icp_classifier.py       4 segments + abstain + Segment 4 gate
+│   │   └── conversation.py         In-memory thread store + phone lookup
+│   ├── enrichment/                 Signal collection
+│   │   ├── crunchbase.py           ODM sample matcher
+│   │   ├── job_posts.py            Playwright scraper (respects robots.txt)
+│   │   ├── layoffs.py              layoffs.fyi CSV parser
+│   │   ├── leadership.py           CTO/VP change detection
+│   │   ├── ai_maturity.py          0-3 scorer with per-input justification
+│   │   ├── competitor_gap.py       Top-quartile cohort comparison
+│   │   └── signal_brief.py         Merges signals → hiring_signal_brief.json
+│   ├── integrations/               External services
+│   │   ├── hubspot.py              Direct REST API + custom properties bootstrap
+│   │   ├── hubspot_mcp.py          MCP client (drop-in interface parity)
+│   │   └── calcom.py               Cal.com v2 bookings
+│   ├── observability/              Tracing
+│   │   ├── langfuse_client.py      SDK v4 adapter
+│   │   └── trace_logger.py         JSONL fallback + metrics aggregation
+│   ├── config.py · llm.py · main.py · models.py
+├── eval/                           τ²-Bench evaluation
+│   ├── harness.py                  Sierra Research runner wrapper
+│   ├── score_log.json              Baseline scores with 95% CIs
+│   └── trace_log.jsonl             Full dev-slice trajectories
+├── scripts/                        CLI entrypoints
+│   ├── run_full_thread_demo.py     Single-prospect end-to-end
+│   ├── run_batch_20.py             20-prospect latency sample
+│   ├── compute_latency.py          p50/p95 from trace log
+│   ├── list_hubspot_mcp_tools.py   Tool-catalog enumeration
+│   ├── build_report.py             Regenerates interim report
+│   └── fetch_data.py               Populates data/ from public sources
+├── tenacious_sales_data/           Real Tenacious seed materials
+│   ├── seed/                       8 files + 2 folders (loaded by email_drafter)
+│   ├── schemas/                    hiring_signal + competitor_gap JSON schemas
+│   └── policy/                     Data-handling policy + acknowledgement
+├── data/                           Public data snapshots
+│   ├── crunchbase_odm_sample.json  1,001 records (Apache 2.0)
+│   ├── layoffs.csv                 3,485 records (CC-BY)
+│   └── job_posts_snapshot.json     Mixed real + synthetic
+├── tests/                          70 tests, pytest + pytest-asyncio
+├── outputs/                        Trace logs, briefs, latency reports
+├── report/                         Interim + final PDF sources
+├── conversion_engine.egg-info/     Editable-install metadata (generated)
+├── tenacious-seeds-placeholder/    Placeholder seed path (legacy; not default)
+├── render.yaml                     Render deployment config
+├── pyproject.toml                  Dependency declarations
+├── uv.lock                         Pinned transitive dependency lockfile (source of truth)
+├── requirements.txt                Pinned export from uv.lock for non-uv tooling
+├── .env.example                    Environment variable template
+├── baseline.md                     τ²-Bench reproduction narrative
+└── README.md
+```
+
+---
+
+## Channel hierarchy & policy
+
+The system enforces a strict **email → SMS → voice** hierarchy, aligned with the buyer persona (founders, CTOs, VPs Engineering, who live in email — cold SMS is a brand risk).
+
+| Channel                            | Used when                                                                               | Gate                                                                                                        |
+| ---------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **Email** (Resend)                 | Always for the first touch                                                              | None — primary channel                                                                                      |
+| **SMS** (Africa's Talking)         | Only after a prospect has replied by email and asked for faster scheduling coordination | `send_sms(warm_lead=False)` raises `SMSChannelPolicyError` at the handler boundary                          |
+| **Voice** (Cal.com discovery call) | Always delivered by a human Tenacious delivery lead — the agent books, humans deliver   | Booking floor is hard-anchored to **after 2026-05-04** so no discovery call lands during the challenge week |
+
+---
+
+## Design decisions
+
+**HubSpot via MCP, not direct REST.** CRM writes route through the official `@hubspot/mcp-server` (21 exposed tools, 5 in active use) via a Python MCP client. The orchestrator talks to a unified `HubSpotClient` interface; `USE_HUBSPOT_MCP` controls transport. A direct-REST fallback engages if MCP setup fails so the demo stays green on any host.
+
+**Kill switch is checked inside every channel handler**, not at the orchestrator boundary. Defense in depth: a misconfigured orchestrator or a rogue script cannot bypass the policy.
+
+**Seed materials loaded at draft time, not cached.** `bench_summary.json` has a weekly `as_of` field; a cached stale count would cause bench-over-commitment, which is a named Act III probe category and a brand-damaging failure mode.
+
+**Tone-preservation check before every send** — a second LLM call scores the draft against `style_guide.md`. Rationale: the cost of a brand-damaging email to a Tenacious CTO dwarfs the cost of a second small LLM call. Auto-regenerate on low score is the Act IV mechanism target.
+
+**JSON-repair fallback on LLM output.** Even with `response_format=json_object`, DeepSeek occasionally emits unterminated strings when the prompt is ~14 k chars (all seed materials loaded). `json-repair` catches these; a warning is logged so operators can track repair frequency.
+
+**In-memory conversation store.** Sufficient for Act II demo; will move to SQLite before Act III adversarial probing (probes exercise multi-day session memory).
+
+**Booking floor hard-anchored to post-challenge-week.** Every Cal.com booking uses `max(today + 14d, 2026-05-04)` with a hard `CHALLENGE_END = 2026-04-25 21:00 UTC` safety check. Slots at or before the deadline are skipped — no demo booking can accidentally land in a staff calendar during the challenge week.
+
+---
+
+## Observability
+
+Every LLM call and every pipeline stage emits a trace. Two sinks run in parallel:
+
+1. **Langfuse** — SDK v4.3.1 via `start_as_current_observation`. Per-trace cost attribution, prompt versioning, session grouping by `thread_id`.
+2. **Local JSONL** — `outputs/full_thread_traces.jsonl`, `outputs/e2e_traces.jsonl`. Enables offline analysis without Langfuse availability.
+
+The evidence graph (`scripts/build_report.py`) walks every numeric claim in the final memo, looks up the referenced `trace_id`, recomputes the number from the raw trace, and flags mismatches — enforcing the "every number resolves to a trace" rule.
+
+Latency snapshot from a 20-prospect batch (2026-04-23):
+
+| Stage                          |     p50 (ms) |     p95 (ms) |
+| ------------------------------ | -----------: | -----------: |
+| Enrich + classify + draft cold |       44,000 |       79,610 |
+| Reply received + warm draft    |       28,703 |       37,953 |
+| HubSpot contact (via MCP)      |          703 |        1,500 |
+| HubSpot note (via MCP)         |          844 |        1,047 |
+| Cal.com booking                |        4,938 |       13,859 |
+| **End-to-end**                 | **≈ 44,000** | **≈ 79,610** |
+
+---
 
 ## Data handling
 
-All prospects during the challenge week are **synthetic** — public Crunchbase firmographics + fictitious contact details. No real customer data leaves Tenacious. Seed materials are under limited license and must be deleted at end-of-week.
+This repository is a **policy-sensitive deliverable.**
 
-## Requirements
+> ⚠️ **Kill switch.** `LIVE_OUTBOUND_ENABLED=false` by default. When unset, every email and SMS routes to the staff-operated sink — **no message reaches a real prospect**. The switch is checked inside every channel handler before any network call.
 
-- Python 3.11+
-- Docker + Docker Compose (for Cal.com)
-- Node.js 20+ (for HubSpot MCP client)
-- OpenRouter, Resend, Africa's Talking, HubSpot Developer Sandbox, Langfuse accounts (all free-tier)
-- ~\$20 total budget envelope (see `INTERIM_SUBMISSION.md` §1)
+**Policy rules** (full text in `tenacious_sales_data/policy/data_handling_policy.md`):
 
-## Directory Index
+- Every prospect the system interacts with during the challenge week is synthetic.
+- Seed materials (style guide, pricing sheet, bench summary, etc.) are licensed for the challenge week only; do not redistribute.
+- Real Tenacious marketing language in outreach to real companies requires separate written approval.
+- Set `LIVE_OUTBOUND_ENABLED=true` only after program staff and the Tenacious executive team review and approve a real-prospect pilot.
 
-Every top-level folder and what an inheritor will find inside it.
+---
 
-| Path | Purpose |
-| ---- | ------- |
-| `agent/` | The runtime. Channel handlers, enrichment pipeline, CRM/calendar tools, conversation composer, and the FastAPI webhook server. |
-| `agent/channels/` | Outbound + inbound channel handlers. `email_resend.py` (Resend, with the free-tier sandbox-sender workaround), `sms_at.py` (Africa's Talking, with the warm-lead gate that blocks any SMS to a prospect that has not replied by email). |
-| `agent/enrichment/` | The four hiring-signal modules + AI maturity scorer + competitor-gap brief builder + pipeline merge. `crunchbase.py` (ODM CSV lookup with funding filter), `job_posts.py` (Playwright BuiltIn/Wellfound/LinkedIn scrape, robots-aware, no login, 60-day velocity), `layoffs_fyi.py` (CSV parser, 120-day window), `leadership.py` (90-day press/news scan), `ai_maturity.py` (six-input 0–3 scorer with per-signal justifications, separate confidence field, silent-company disclaimer), `competitor_gap.py` (peer discovery + same-rubric scoring + distribution position + sparse-sector handling), `pipeline.py` (merges everything into `data/schemas/hiring_signal_brief.schema.json`). |
-| `agent/tools/` | External-system clients. `hubspot_mcp.py` (contact upsert + booking write-back; nine enrichment fields), `calcom_booking.py` (booking creation + reply-router handler that fires HubSpot record_booking on confirmation). |
-| `agent/composer.py` | Central conversation orchestrator. Wires email and SMS sends through HubSpot activity writes at every conversation event point (outreach prepared, slots proposed, outreach sent, outreach failed, reply received, cold SMS blocked, booking confirmed). Also home of `propose_booking_slots`, the single function called from BOTH the email and SMS paths to generate Cal.com links. |
-| `agent/webhook.py` | FastAPI ingress for Resend, Africa's Talking, Cal.com, HubSpot. Plus the manual `POST /conversations/reply` endpoint — the Slack-tutor-confirmed workaround for the Resend free-tier reply-webhook gap. |
-| `agent/reply_router.py` | Shared callback registry every webhook adapter dispatches into. Keeps webhook routes free of business logic. Also owns the warm-prospect set the SMS gate reads. |
-| `tests/` | 42 unit tests across reply router, channels, enrichment, AI-maturity silent-company, composer integration, and competitor-gap peer discovery. All passing. |
-| `eval/` | τ²-Bench retail harness wrapper plus the authoritative reference baseline: `score_log.json` (pass@1 = 0.7267 over 150 simulations) and `trace_log.jsonl` (per-simulation cost, latency, reward). `ablation_results.json` carries the Act IV mechanism + ablation conditions with the Day-1 baseline filled in and method/ablation rows reserved for the held-out run. |
-| `probes/` | Adversarial probe library and the failure taxonomy that grades it. `probe_library.md` (32 probes across all 10 challenge categories, 8 Tenacious-specific). `failure_taxonomy.md` (every probe categorised, aggregate trigger rates, shared patterns). `target_failure_mode.md` (selects C2 hiring-signal over-claiming with arithmetic in Tenacious unit economics, comparison against C7 and C8 alternatives). |
-| `method.md` | The Act IV mechanism design — Honesty Gate + Tone-Preservation Re-check. Hyperparameters table, three ablation variants with explicit contrasts, paired-bootstrap statistical-test plan. Re-implementable from this document alone. |
-| `INTERIM_SUBMISSION.md` | The 2-page final memo (Page 1 Decision, Page 2 Skeptic's Appendix) addressed to the Tenacious CEO and CFO. Every numeric claim resolves to a file in this repo. |
-| `baseline.md` | The Act I writeup — the 386-word ≤400-word baseline document the challenge requires. |
-| `data/seed/` | Tenacious-provided seed materials under limited challenge-week license: `icp_definition.md`, `style_guide.md`, `pricing_sheet.md`, `bench_summary.json`, `baseline_numbers.md`, `case_studies.md`, plus `email_sequences/` and `discovery_transcripts/`. |
-| `data/schemas/` | The brief schemas the enrichment pipeline produces and the composer reads: `hiring_signal_brief.schema.json`, `competitor_gap_brief.schema.json`, with sample artefacts for each. |
-| `data/policy/` | `data_handling_policy.md` and the signed `acknowledgement.md` filed with program staff. |
-| `data/briefs/cb-a1b2c3/` | Test-prospect (Acme Robotics) hiring + competitor-gap briefs used by the demo flow. |
-| `configs/` | `pinned_models.yaml` (model + temperature + seed for τ²-Bench reproducibility) and `kill_switch.env.example` (template the trainee copies to `.env`). |
-| `docs/` | `demo_video_script.md` (8-min video script with section→rubric mapping), `screens/` (HubSpot + Cal.com screenshots), `verification/` (live-provider smoke logs). |
-| `scripts/` | One-shot helper scripts referenced from the demo and runbook. |
-| `Technical Challenge/` | The three program-issued reference docs (TRP1 spec, supporting scenario, draft sales materials). Read-only. |
+## Handoff for the inheriting engineer
 
-## Setup
+What you should know in the first thirty minutes if you pick this repo up
+after I'm gone. Read this section before any other.
 
-Prerequisites:
+### Where the meaningful work lives
 
-- Python 3.11+
-- Docker + Docker Compose (for Cal.com)
-- Node.js 20+ (for the HubSpot MCP client)
-- Free-tier accounts: Resend, Africa's Talking sandbox, HubSpot Developer Sandbox, Cal.com (self-hosted), Langfuse cloud, OpenRouter
-- ~\$20 total budget envelope (see `INTERIM_SUBMISSION.md` Page 1 cost-per-qualified-lead derivation)
+| Question                                  | File / artifact                                                                                                                                                               |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| What does the system do for one prospect? | [agent/core/orchestrator.py](agent/core/orchestrator.py) `process_new_prospect`                                                                                               |
+| How are prospects qualified?              | [agent/core/icp_classifier.py](agent/core/icp_classifier.py) (4 segments + abstain)                                                                                           |
+| How is the email written?                 | [agent/core/email_drafter.py](agent/core/email_drafter.py) (two LLM calls per draft: draft + tone-check)                                                                      |
+| What's the Act IV mechanism?              | [agent/core/scap.py](agent/core/scap.py), wired into `email_drafter.py`; design rationale in [eval/method.md](eval/method.md)                                                 |
+| Where are the failure probes?             | [eval/probes/](eval/probes/) — 37 probes, runner emits [probe_results.json](eval/probes/probe_results.json)                                                                   |
+| What's the held-out evaluation?           | [eval/heldout_slice.json](eval/heldout_slice.json) (sealed task IDs); orchestrator [eval/run_heldout.py](eval/run_heldout.py); stats [eval/scap_stats.py](eval/scap_stats.py) |
+| What does the memo say?                   | [report/memo.md](report/memo.md) → `report/memo.pdf` (2 pages, every number traces to [report/evidence_graph.json](report/evidence_graph.json))                               |
+| How do I operate this in prod?            | [docs/runbook.md](docs/runbook.md) (Incident response, kill-switch SOPs, daily ops checklist)                                                                                 |
+| What are the parameter risks?             | [docs/sensitivity_analysis.md](docs/sensitivity_analysis.md) (Impact of AI-maturity weights & velocity windows)                                                               |
 
-Run order for local bootstrap:
+### Kill-switch behavior — verify before going live
 
-```bash
-# 1. Clone + install
-git clone https://github.com/<org>/conversion-engine.git
-cd conversion-engine
-python -m venv .venv && source .venv/bin/activate
-pip install -r agent/requirements.txt
+- `LIVE_OUTBOUND_ENABLED=false` (default). All outbound (email/SMS) routes
+  to the staff sink address from [.env.example](.env.example). Verified in
+  [agent/channels/email_handler.py](agent/channels/email_handler.py) and
+  [agent/channels/sms_handler.py](agent/channels/sms_handler.py) — both
+  short-circuit at the first network call and emit a trace with
+  `event_type=routed_to_sink`.
+- `LIVE_OUTBOUND_ENABLED=true` requires explicit operator action plus
+  written approval from the Tenacious executive team and program staff
+  (see policy in [tenacious_sales_data/policy/](tenacious_sales_data/policy/)).
+- `enable_scap=true` (default) is **safe to ship**; setting it to false
+  reverts the drafter to Day-1 baseline behavior (no LOW-confidence
+  stripping, no MEDIUM softening). Useful for A/B testing or if SCAP
+  regresses on a future model.
 
-# 2. Provision .env (kept out of git via .gitignore)
-cp configs/kill_switch.env.example .env
-# Fill in: RESEND_API_KEY, AT_USERNAME, AT_API_KEY, HUBSPOT_TOKEN,
-#          CALCOM_BASE_URL, CALCOM_EVENT_TYPE_ID, OPENROUTER_API_KEY,
-#          LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, WEBHOOK_BASE_URL.
-# Resend free tier: keep RESEND_FROM_ADDRESS=onboarding@resend.dev.
+### Cost envelope
 
-# 3. Start Cal.com
-cd infra/calcom && docker compose up -d && cd -
+| Spend                                                                 | Where                    | Approx     |
+| --------------------------------------------------------------------- | ------------------------ | ---------- |
+| Interim baseline (150 sims, dev slice)                                | OpenRouter / DeepSeek V3 | $2.99      |
+| Probe runner (DET + LLM + TRACE, N=3)                                 | OpenRouter / DeepSeek V3 | $0.12      |
+| Held-out sweep (6 conditions, 480 sims)                               | OpenRouter / DeepSeek V3 | ~$1.00     |
+| Production rig (Resend, Africa's Talking, HubSpot, Cal.com, Langfuse) | All free tiers           | $0         |
+| **Challenge-week total**                                              |                          | **~$4.20** |
 
-# 4. Load enrichment data into the paths declared in .env
-#    CRUNCHBASE_ODM_PATH         data/crunchbase_odm_sample.csv
-#    LAYOFFS_FYI_CSV_PATH        data/layoffs_fyi.csv
-#    JOB_POST_SNAPSHOT_DIR       data/snapshots/job_posts/
+Per-qualified-lead cost in production = **~$0.01** (LLM only; rig free
+tiers cover up to ~3,000 emails/month). Tenacious's cost-quality Pareto
+target is < $5 / lead; we are 500× under.
 
-# 5. Launch the webhook server (the runtime ingress)
-uvicorn agent.webhook:app --host 0.0.0.0 --port 8000
-
-# 6. Verify the stack
-python -m agent.channels.email_resend     # Resend smoke
-python -m agent.channels.sms_at           # AT smoke
-python -m agent.tools.hubspot_mcp         # HubSpot smoke
-python -m agent.tools.calcom_booking      # Cal.com smoke
-
-# 7. Run the test suite
-python -m pytest tests/ -q                # 42 tests, all passing
-
-# 8. Reproduce the Act I baseline
-cd eval && python tau2_harness.py --domain retail --trials 5 --slice dev
-```
-
-Pinned dependency versions live in `agent/requirements.txt` (FastAPI 0.115.0, uvicorn 0.32.0, pydantic 2.9.2, httpx 0.27.2, resend 2.4.0, africastalking 1.2.9, mcp 1.0.0, playwright 1.47.0, langfuse 2.54.0, openai 1.54.0, anthropic 0.39.0, scipy 1.14.1).
-
-Configuration variables: see `configs/kill_switch.env.example` for the full list with inline comments explaining each one. The kill-switch (`TENACIOUS_LIVE_OUTREACH`) is **unset by default** — every outbound message routes to `STAFF_SINK_EMAIL` / `STAFF_SINK_PHONE`. Live routing requires both an explicit env flag and a reviewer-signed approval at `configs/live_outreach_approval.json`.
-
-## Rubric → code map
-
-For reviewers: every GitHub-rubric line maps to a specific module or document.
-
-| Rubric criterion | Where it lives |
-| ---------------- | -------------- |
-| Architecture & inheritor readiness | This README — diagram above, directory index above, setup section above, limitations + handoff notes below |
-| Multi-channel production integration | `agent/channels/email_resend.py` (Resend send + reply webhook + bounce paths), `agent/channels/sms_at.py` (AT send + inbound + warm-lead gate), `agent/tools/hubspot_mcp.py` (contact upsert with 9 enrichment fields + booking write-back), `agent/tools/calcom_booking.py` (booking creation), `agent/composer.py` (HubSpot activity writes at multiple event points + Cal.com link generation referenced from BOTH email and SMS paths), `agent/reply_router.py` (centralised channel handoff state machine) |
-| Hiring signal enrichment pipeline | `agent/enrichment/crunchbase.py`, `agent/enrichment/job_posts.py`, `agent/enrichment/layoffs_fyi.py`, `agent/enrichment/leadership.py`, `agent/enrichment/pipeline.py` (merge + per-signal confidence + 60-day velocity), `data/schemas/hiring_signal_brief.schema.json` (schema), `data/schemas/sample_hiring_signal_brief.json` (artefact) |
-| AI maturity scoring system | `agent/enrichment/ai_maturity.py` — six-input scorer (high/medium/low tiers), 0–3 integer return, per-signal justifications, separate `confidence_label`, explicit `silent_company` flag with disclaimer text |
-| Competitor gap brief generation | `agent/enrichment/competitor_gap.py` — `discover_top_quartile_peers` (selection criteria with sector + headcount-band filters), `score_peer_ai_maturity` (re-uses the prospect-scoring rubric), `compute_distribution_position` (percentile in cell), `build` (assembles brief with sparse-sector handling), `data/schemas/competitor_gap_brief.schema.json` (schema), `data/schemas/sample_competitor_gap_brief.json` (artefact) |
-| Adversarial probe library | `probes/probe_library.md` |
-| Failure taxonomy + target failure mode | `probes/failure_taxonomy.md`, `probes/target_failure_mode.md` |
-| Mechanism design documentation | `method.md` |
-
-Run the tests:
+### Re-running the full evaluation
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install pytest fastapi httpx
-python -m pytest tests/ -q
+# 1. Run the 30-task dev slice baseline (~$3, ~30 min wall)
+python -m eval.harness
+
+# 2. Run the 37 adversarial probes (~$0.12, ~17 min wall, requires OPENROUTER_API_KEY)
+python -m eval.probes.probe_runner --n-llm 3
+
+# 3. Run the held-out sweep (6 conditions, ~$1, ~3-5h wall)
+python -m eval.run_heldout
+
+# 4. Compute paired-bootstrap deltas (free, < 1 min)
+python -m eval.scap_stats
+
+# Outputs:
+#   eval/score_log.json
+#   eval/trace_log.jsonl
+#   eval/probes/probe_results.json
+#   eval/ablation_results.json   (with stats block appended in step 4)
+#   eval/held_out_traces.jsonl
 ```
 
-## Status
+---
 
-- Act I (baseline) ✅ — τ²-Bench retail, 150 simulations, 0 infra errors, pass@1 = **0.7267 [0.6504, 0.7917]**, avg cost \$0.0199/run, p50 105.95 s, p95 551.65 s (`eval/score_log.json`, commit `d11a9707`)
-- Act II (production stack) ✅ — four-signal enrichment, email/SMS channels (channel-hierarchy gate enforced), HubSpot MCP writes at five conversation event points, Cal.com link generation referenced from both email and SMS paths, kill-switch default-off
-- Act III (probes) ✅ — 32 probes across all 10 categories (`probes/probe_library.md`)
-- Act IV (mechanism) ✅ — Honesty Gate + Tone-Preservation Re-check (`method.md`); held-out scoring run pending
-- Act V (memo) ✅ — `INTERIM_SUBMISSION.md`
 
-## Limitations & Handoff Notes
-
-Concrete items the next engineer will hit. Listed in priority order.
-
-1. **Resend reply webhooks are NOT delivered on the free tier.** Confirmed by program tutors in Slack 2026-04-25. The system uses a manual `POST /conversations/reply` ingestion endpoint as the supported workaround. To restore real reply webhooks, verify a sending domain in Resend and switch the From address back from `onboarding@resend.dev`.
-2. **The `agent/main.py` orchestrator is a skeleton (`NotImplementedError`).** The runtime end-to-end loop is currently driven by `agent/composer.py` plus the webhook server. Any successor who wants a single-call CLI entry will need to flesh out `main.py` to sequence enrichment → compose → send → poll-or-await-reply → book.
-3. **Leadership-change recall is low** because `agent/enrichment/leadership.py` only reads a news-items list its caller supplies. The adapter that would pull Crunchbase news + a LinkedIn public-feed snapshot is not yet implemented (see probe P-030, hand-labelled FN rate 0.28). Build `agent/enrichment/news_adapter.py` to close the gap.
-4. **The Act IV mechanism's held-out scoring is pending.** `eval/ablation_results.json` carries the Day-1 baseline filled in and `null` placeholders for `method` + three ablations. The Day-6 sealed-held-out run populates them; the statistical test plan is in `method.md`.
-5. **Hand-labelled AI-maturity validation set is n=25** (precision 0.84, recall 0.72). Scale to n=60 before quoting precision/recall in the final memo for Tenacious — the current numbers are directional, not defensible.
-6. **HubSpot MCP token rate limit** (100 calls / 10 s on the free tier). The composer fires multiple writes per conversation event; under burst load (more than ~12 concurrent prospects) the rate limit will trip. Add a token-bucket in `agent/tools/hubspot_mcp.py` before scaling beyond pilot volume.
-7. **Cal.com self-hosted is on `localhost:3000`** — production must terminate behind HTTPS with a registered webhook secret. The signing-secret verification is already in `agent/webhook.py::calcom_webhook` but is no-op when `CALCOM_WEBHOOK_SECRET` is empty.
-8. **Langfuse `@observe` decorators are not yet attached** to the send/receive seams. The dependency is in `agent/requirements.txt`; one afternoon to wire the decorators across composer + channels + tools.
-9. **Voice tier (the bonus channel) is not scaffolded.** Shared Voice Rig webhook URL is unregistered. Day-7 work if pursuing the bonus.
-10. **Probe sweep budget.** With p50 simulation latency of 105.95 s on the dev-tier model, a 30-probe × 10-trial sweep is ~9 hours of wall-clock and ~\$6 of LLM spend. The current Act III run is down-sampled to 32 probes × ~3.8 trials. Successor wanting full 10-trial coverage on every probe must either widen the dev-tier budget or run with concurrency ≥ 4.
-
-## License
-
-Code: to be added.
-Seed materials (Tenacious): limited challenge-week license; do not redistribute.
+- **Code:** source code in `agent/`, `scripts/`, `tests/`, and `eval/` is written by the trainee for the TRP1 Week 10 challenge.
+- **Seed materials:** `tenacious_sales_data/` is delivered under a limited challenge-week license from Tenacious Consulting — see `tenacious_sales_data/LICENSE.md`.
+- **Public datasets:**
+  - Crunchbase ODM sample — Apache 2.0, via [luminati-io/Crunchbase-dataset-samples](https://github.com/luminati-io/Crunchbase-dataset-samples)
+  - layoffs.fyi — CC-BY
+  - τ²-Bench — Apache 2.0, via [sierra-research/tau2-bench](https://github.com/sierra-research/tau2-bench)
+- **Third-party services:** Resend, Africa's Talking, HubSpot, Cal.com, Langfuse, OpenRouter — each governed by its own terms.

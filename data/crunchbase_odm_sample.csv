@@ -1,8 +1,0 @@
-uuid,name,domain,categories,employee_count,country_code,last_funding_type,last_funding_total,last_funding_at,tech_stack,founders
-cb-a1b2c3,Acme Robotics Inc.,orrin-labs.example,Industrial Robotics; AI and Analytics,51-100,USA,series_b,22000000,2026-02-11,"dbt,snowflake,databricks",Pat Founder
-cb-peer01,Cobalt Robotics,cobalt-robotics.example,Industrial Robotics,51-100,USA,series_b,18000000,2025-11-04,"dbt,snowflake",
-cb-peer02,Vortex Industrial,vortex-industrial.example,Industrial Robotics,51-100,USA,series_b,25000000,2026-01-15,"snowflake,databricks",
-cb-peer03,Lumen Automation,lumen-automation.example,Industrial Robotics,51-100,USA,series_a,9000000,2025-08-20,"dbt",
-cb-peer04,Hexapod Systems,hexapod-systems.example,Industrial Robotics,51-100,USA,series_b,14000000,2025-09-02,"databricks,vllm",
-cb-peer05,Kestrel Manufacturing,kestrel-mfg.example,Industrial Robotics,51-100,USA,series_a,7500000,2025-12-12,"dbt,snowflake",
-cb-peer06,Origami Robotics,origami-robotics.example,Industrial Robotics,51-100,USA,series_c,40000000,2026-02-28,"snowflake,databricks,vllm",
