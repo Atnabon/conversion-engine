@@ -1,0 +1,123 @@
+{
+  "claims": [
+    {
+      "claim_id": "c1",
+      "claim_text": "Our Method (SCAP Full) pass@1 is 60%",
+      "page": 1,
+      "section": "tau2_bench_table",
+      "source_type": "trace_file",
+      "source_ref": "eval/ablation_results.json#condition=scap_full",
+      "value": 0.60,
+      "ci_95": [0.57, 0.63]
+    },
+    {
+      "claim_id": "c2",
+      "claim_text": "Cost per task for SCAP Full is $0.043",
+      "page": 1,
+      "section": "tau2_bench_table",
+      "source_type": "trace_file",
+      "source_ref": "eval/ablation_results.json#condition=scap_full",
+      "value": 0.043
+    },
+    {
+      "claim_id": "c3",
+      "claim_text": "Our Day 1 Baseline pass@1 is 61%",
+      "page": 1,
+      "section": "tau2_bench_table",
+      "source_type": "trace_file",
+      "source_ref": "eval/ablation_results.json#condition=baseline",
+      "value": 0.61,
+      "ci_95": [0.53, 0.69]
+    },
+    {
+      "claim_id": "c4",
+      "claim_text": "Published tau2-Bench reference is ~42%",
+      "page": 1,
+      "section": "tau2_bench_table",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": 0.42
+    },
+    {
+      "claim_id": "c5",
+      "claim_text": "60 outbound touches per week target",
+      "page": 1,
+      "section": "pilot_scope_recommendation",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": 60
+    },
+    {
+      "claim_id": "c6",
+      "claim_text": "Manual stalled-thread rate 30-40%",
+      "page": 1,
+      "section": "speed_to_lead_delta",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": [0.30, 0.40]
+    },
+    {
+      "claim_id": "c7",
+      "claim_text": "Task latency p50 is 24.7 seconds",
+      "page": 1,
+      "section": "speed_to_lead_delta",
+      "source_type": "trace_file",
+      "source_ref": "eval/ablation_results.json#condition=scap_full",
+      "value": 24.7
+    },
+    {
+      "claim_id": "c8",
+      "claim_text": "Signal-Grounded Variant pass@1 is 60%",
+      "page": 1,
+      "section": "competitive_gap_outbound_performance",
+      "source_type": "trace_file",
+      "source_ref": "eval/ablation_results.json#condition=scap_full",
+      "value": 0.60
+    },
+    {
+      "claim_id": "c9",
+      "claim_text": "Generic Variant pass@1 is 61%",
+      "page": 1,
+      "section": "competitive_gap_outbound_performance",
+      "source_type": "trace_file",
+      "source_ref": "eval/ablation_results.json#condition=baseline",
+      "value": 0.61
+    },
+    {
+      "claim_id": "c10",
+      "claim_text": "Discovery call to proposal conversion 30-50%",
+      "page": 1,
+      "section": "annualized_dollar_impact",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": [0.30, 0.50]
+    },
+    {
+      "claim_id": "c11",
+      "claim_text": "Proposal to close conversion 20-30%",
+      "page": 1,
+      "section": "annualized_dollar_impact",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": [0.20, 0.30]
+    },
+    {
+      "claim_id": "c12",
+      "claim_text": "ACV range $240-720K",
+      "page": 1,
+      "section": "annualized_dollar_impact",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": [240000, 720000]
+    },
+    {
+      "claim_id": "c13",
+      "claim_text": "Annualized revenue leak $2.2M",
+      "page": 2,
+      "section": "honest_unresolved_failure",
+      "source_type": "seed_material",
+      "source_ref": "tenacious_sales_data/seed/baseline_numbers.md",
+      "value": 2200000
+    }
+  ]
+}
